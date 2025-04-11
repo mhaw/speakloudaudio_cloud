@@ -16,11 +16,9 @@ HEADERS = {
 
 def extract_text_from_url(url: str, retries: int = 3, backoff_factor: int = 2) -> Dict[str, Any]:
     """
-    Extracts article text, title, and author information from the provided URL.
-    Returns a dictionary containing the text and metadata.
-    Retries extraction with exponential backoff if it fails.
+    Extracts article text, title, author info, and publish date from the provided URL.
+    Tries newspaper3k first, then falls back to BeautifulSoup + meta tags.
     """
-    # Initialize article data with default values
     article_data = {
         "title": "Unknown Title",
         "text": "",
@@ -29,23 +27,19 @@ def extract_text_from_url(url: str, retries: int = 3, backoff_factor: int = 2) -
         "source": url
     }
 
-    # Retry mechanism for transient errors
     for attempt in range(retries):
         try:
-            # Configuration to set up headers
-            user_agent_config = Config()
-            user_agent_config.browser_user_agent = HEADERS['User-Agent']
-            user_agent_config.request_timeout = 15  # Timeout for newspaper
+            config = Config()
+            config.browser_user_agent = HEADERS["User-Agent"]
+            config.request_timeout = 15
 
-            # Attempt to extract using newspaper3k
-            article = Article(url, config=user_agent_config)
+            article = Article(url, config=config)
             article.download()
             article.parse()
 
-            # Extract and set article data, falling back to defaults if any are empty
-            article_data["title"] = article.title if article.title else "Unknown Title"
-            article_data["text"] = article.text if article.text else ""
-            article_data["authors"] = article.authors if article.authors else ["Unknown Author"]
+            article_data["title"] = article.title or article_data["title"]
+            article_data["text"] = article.text or article_data["text"]
+            article_data["authors"] = article.authors or article_data["authors"]
             if article.publish_date:
                 article_data["publish_date"] = article.publish_date.strftime("%Y-%m-%d")
 
@@ -53,40 +47,49 @@ def extract_text_from_url(url: str, retries: int = 3, backoff_factor: int = 2) -
             return article_data
 
         except HTTPError as http_err:
-            logging.warning(f"HTTP error occurred on attempt {attempt + 1}/{retries} for URL {url}: {http_err}")
+            logging.warning(f"HTTP error on attempt {attempt + 1}/{retries} for {url}: {http_err}")
         except RequestException as req_err:
-            logging.warning(f"Request error occurred on attempt {attempt + 1}/{retries} for URL {url}: {req_err}")
+            logging.warning(f"Request error on attempt {attempt + 1}/{retries} for {url}: {req_err}")
         except Exception as e:
-            logging.error(f"An error occurred on attempt {attempt + 1}/{retries} for URL {url}: {e}")
+            logging.error(f"Unexpected error on attempt {attempt + 1}/{retries} for {url}: {e}")
 
-        # Exponential backoff
         time.sleep(backoff_factor ** attempt)
 
-    # Fallback mechanism using requests and BeautifulSoup
+    # Fallback extraction using requests + BeautifulSoup
     try:
-        logging.info(f"Attempting fallback extraction using requests and BeautifulSoup for URL: {url}")
+        logging.info(f"Fallback extraction using BeautifulSoup for URL: {url}")
         response = requests.get(url, headers=HEADERS, timeout=15)
         response.raise_for_status()
-
         soup = BeautifulSoup(response.content, 'html.parser')
 
-        # Extract title
-        title_tag = soup.find('title')
-        if title_tag:
-            article_data["title"] = title_tag.text.strip()
+        # Title
+        if soup.title:
+            article_data["title"] = soup.title.string.strip()
 
-        # Extract text from <p> tags
+        # Text
         paragraphs = soup.find_all('p')
         if paragraphs:
-            article_data["text"] = " ".join(p.get_text().strip() for p in paragraphs)
+            article_data["text"] = " ".join(p.get_text().strip() for p in paragraphs if p.get_text().strip())
+
+        # Metadata from OpenGraph, Twitter, or article meta tags
+        meta_title = soup.find("meta", property="og:title") or soup.find("meta", attrs={"name": "twitter:title"})
+        if meta_title and meta_title.get("content"):
+            article_data["title"] = meta_title["content"]
+
+        meta_author = soup.find("meta", attrs={"name": "author"})
+        if meta_author and meta_author.get("content"):
+            article_data["authors"] = [meta_author["content"]]
+
+        meta_date = soup.find("meta", property="article:published_time") or soup.find("meta", attrs={"name": "date"})
+        if meta_date and meta_date.get("content"):
+            try:
+                article_data["publish_date"] = datetime.datetime.fromisoformat(meta_date["content"]).strftime("%Y-%m-%d")
+            except Exception as e:
+                logging.warning(f"Could not parse publish date: {e}")
 
         logging.info(f"Fallback extraction successful for URL: {url}")
 
-    except HTTPError as http_err:
-        logging.error(f"HTTP error occurred during fallback extraction for URL {url}: {http_err}")
-    except RequestException as req_err:
-        logging.error(f"Request error occurred during fallback extraction for URL {url}: {req_err}")
     except Exception as e:
-        logging.error(f"Unexpected error during fallback extraction for URL {url}: {e}")
+        logging.error(f"Fallback extraction failed for URL {url}: {e}")
 
     return article_data

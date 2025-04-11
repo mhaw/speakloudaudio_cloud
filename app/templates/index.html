@@ -54,6 +54,15 @@
                     placeholder="e.g., technology, news, audio" 
                     class="w-full p-4 mb-6 border border-gray-300 dark:border-gray-600 rounded focus:outline-none focus:border-blue-500 dark:focus:border-blue-400 bg-white dark:bg-gray-700 text-black dark:text-white">
 
+                <!-- Optional: Voice Selection -->
+                <label for="voice-name" class="block text-sm font-semibold mb-2">Voice Style (optional)</label>
+                <select id="voice-name" name="voice_name"
+                    class="w-full p-4 mb-6 border border-gray-300 dark:border-gray-600 rounded focus:outline-none focus:border-blue-500 dark:focus:border-blue-400 bg-white dark:bg-gray-700 text-black dark:text-white">
+                    <option value="">Default</option>
+                    <option value="en-US-Wavenet-D">US Male (Wavenet-D)</option>
+                    <option value="en-US-Wavenet-F">US Female (Wavenet-F)</option>
+                </select>
+
                 <!-- Submit Button -->
                 <button 
                     type="submit" 
@@ -67,7 +76,7 @@
 
             <!-- Spinner -->
             <div id="loading-spinner" class="text-center mb-8 hidden">
-                <p class="mb-4">Processing...</p>
+                <p class="mb-4">Processing your article...</p>
                 <div class="spinner border-t-4 border-blue-500 rounded-full w-12 h-12 animate-spin mx-auto"></div>
             </div>
 
@@ -110,20 +119,19 @@
 
         // Form submission with feedback, spinner, and dynamic update
         document.getElementById("url-form").onsubmit = async (event) => {
-            event.preventDefault(); // Prevent default form submission
+            event.preventDefault();
             const form = event.target;
             const url = form.querySelector("#url-input").value;
             const hashtags = form.querySelector("#hashtags").value;
+            const voiceName = form.querySelector("#voice-name").value;
 
-            // UI elements
             const feedback = document.getElementById("feedback");
             const spinner = document.getElementById("loading-spinner");
             const button = form.querySelector("button[type=submit]");
             const recentlyProcessed = document.getElementById("recently-processed");
             const audioSource = document.getElementById("recent-audio-source");
             const detailsLink = document.getElementById("details-link");
-            
-            // Update UI for processing
+
             feedback.classList.add("hidden");
             spinner.classList.remove("hidden");
             button.textContent = "Processing...";
@@ -133,12 +141,11 @@
                 const response = await fetch("/process_article", {
                     method: "POST",
                     headers: { "Content-Type": "application/x-www-form-urlencoded" },
-                    body: new URLSearchParams({ url, hashtags }),
+                    body: new URLSearchParams({ url, hashtags, voice_name: voiceName }),
                 });
 
                 if (response.ok) {
                     const result = await response.json();
-                    // Display the recently processed file
                     audioSource.src = result.audio_url;
                     detailsLink.href = result.details_url;
                     detailsLink.textContent = "View Details";

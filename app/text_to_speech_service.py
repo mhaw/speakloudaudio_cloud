@@ -1,20 +1,23 @@
 import logging
 import tempfile
 import os
-import re
 import time
 from google.cloud import texttospeech
 from pydub import AudioSegment
 from typing import List, Dict, Optional
+import nltk
+from nltk.tokenize import sent_tokenize
 
 class TTSConversionError(Exception):
     """Custom exception for Text-to-Speech conversion errors."""
     pass
 
+nltk.download('punkt')
+
 def split_text_by_bytes(text: str, max_bytes: int = 5000) -> List[str]:
-    """Splits text into chunks that fit within a byte limit for TTS processing."""
+    """Splits text into chunks using nltk sentence tokenizer and byte limit."""
     chunks, current_chunk = [], ""
-    for sentence in re.split(r'(?<=[.!?]) +', text):
+    for sentence in sent_tokenize(text):
         sentence_bytes = len(sentence.encode('utf-8'))
         if len(current_chunk.encode('utf-8')) + sentence_bytes <= max_bytes:
             current_chunk += sentence + " "
@@ -40,15 +43,15 @@ def synthesize_text_chunk(
     client: texttospeech.TextToSpeechClient,
     voice: texttospeech.VoiceSelectionParams,
     audio_config: texttospeech.AudioConfig,
+    use_ssml: bool = False,
     retries: int = 3
 ) -> str:
-    """Helper function to synthesize a text chunk with retries and save it to a temporary file."""
+    """Synthesizes a text chunk with retries, optionally using SSML."""
     for attempt in range(retries):
         try:
-            synthesis_input = texttospeech.SynthesisInput(text=chunk)
-            response = client.synthesize_speech(input=synthesis_input, voice=voice, audio_config=audio_config)
+            input_data = texttospeech.SynthesisInput(ssml=f"<speak>{chunk}</speak>") if use_ssml else texttospeech.SynthesisInput(text=chunk)
+            response = client.synthesize_speech(input=input_data, voice=voice, audio_config=audio_config)
 
-            # Write the audio content to a temporary file
             temp_file = tempfile.NamedTemporaryFile(delete=False, suffix=".mp3")
             temp_file.write(response.audio_content)
             temp_file.close()
@@ -70,9 +73,10 @@ def text_to_speech(
     language_code: str = "en-US",
     gender: texttospeech.SsmlVoiceGender = texttospeech.SsmlVoiceGender.NEUTRAL,
     voice_name: Optional[str] = None,
+    use_ssml: bool = False,
     retries: int = 3
-) -> None:
-    """Converts text to speech in chunks, adds metadata as an intro, and saves as a single MP3 file."""
+) -> float:
+    """Converts text to speech, normalizes volume, and returns audio length in seconds."""
     client = texttospeech.TextToSpeechClient()
     voice = texttospeech.VoiceSelectionParams(
         language_code=language_code,
@@ -81,35 +85,31 @@ def text_to_speech(
     )
     audio_config = texttospeech.AudioConfig(audio_encoding=texttospeech.AudioEncoding.MP3)
 
-    # Use the metadata formatter to create an intro
     intro_text = format_metadata_text(metadata)
-
-    # Combine intro with main text and split into manageable chunks
-    full_text = intro_text + " " + text
+    full_text = f"{intro_text} {text}"
     text_chunks = split_text_by_bytes(full_text)
     temp_files = []
 
     try:
         for i, chunk in enumerate(text_chunks):
-            temp_file_path = synthesize_text_chunk(chunk, client, voice, audio_config, retries)
+            temp_file_path = synthesize_text_chunk(chunk, client, voice, audio_config, use_ssml, retries)
             temp_files.append(temp_file_path)
             logging.info(f"Generated audio for chunk {i + 1}/{len(text_chunks)}")
 
-        # Concatenate all audio chunks into the final file
         combined_audio = AudioSegment.empty()
         for temp_file_path in temp_files:
             combined_audio += AudioSegment.from_mp3(temp_file_path)
 
-        # Normalize audio to ensure consistent volume levels
         combined_audio = combined_audio.normalize()
         combined_audio.export(output_file, format="mp3")
         logging.info(f"Concatenated audio saved as: {output_file}")
+
+        return combined_audio.duration_seconds
 
     except TTSConversionError as e:
         logging.error(f"Error during text-to-speech conversion: {e}")
         raise
     finally:
-        # Clean up temporary files
         for temp_file in temp_files:
             if os.path.exists(temp_file):
                 os.remove(temp_file)

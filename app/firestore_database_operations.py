@@ -25,7 +25,8 @@ def retry_on_failure(max_retries=3, delay=2):
     return decorator
 
 @retry_on_failure()
-def save_article_metadata(title, source, url, publish_date, download_link, authors="Unknown", text_content="", hashtags=[]):
+def save_article_metadata(title, source, url, publish_date, download_link, authors="Unknown",
+                          text_content="", hashtags=[], voice_name=None, audio_length=None):
     """Saves metadata for a processed article into Firestore."""
     try:
         article_data = {
@@ -37,15 +38,21 @@ def save_article_metadata(title, source, url, publish_date, download_link, autho
             "download_link": download_link,
             "authors": authors,
             "text_content": text_content,
-            "hashtags": hashtags  # Add hashtags to the document
+            "hashtags": hashtags,
         }
+
+        if voice_name:
+            article_data["voice_name"] = voice_name
+        if audio_length is not None:
+            article_data["audio_length"] = audio_length
+
         doc_ref = firestore_client.collection("articles").add(article_data)
         logging.info(f"Article metadata saved for URL: {url} with hashtags: {hashtags}")
-        return doc_ref[1].id  # Returns the generated document ID
+        return doc_ref[1].id
     except Exception as e:
         logging.error(f"Firestore error while saving article metadata: {e}")
         raise
-
+    
 @retry_on_failure()
 def get_all_articles():
     """Fetches all articles from Firestore and returns them as dictionaries."""

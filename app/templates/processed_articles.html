@@ -9,8 +9,6 @@
     <link rel="stylesheet" href="https://cdn.datatables.net/1.11.5/css/jquery.dataTables.min.css">
     <script src="https://code.jquery.com/jquery-3.6.0.min.js"></script>
     <script src="https://cdn.datatables.net/1.11.5/js/jquery.dataTables.min.js"></script>
-    <link rel="stylesheet" href="{{ url_for('static', filename='css/styles.css') }}">
-
 </head>
 
 <body class="bg-gray-100 text-gray-900 dark:bg-gray-900 dark:text-gray-100">
@@ -49,7 +47,7 @@
                         <th class="p-3 text-left">Processed Date</th>
                         <th class="p-3 text-left">Hashtags</th>
                         <th class="p-3 text-left">Listen Count</th>
-                        <th class="p-3 text-left">Audio</th>
+                        <th class="p-3 text-left">Voice</th>
                         <th class="p-3 text-left">Actions</th>
                     </tr>
                 </thead>
@@ -78,12 +76,7 @@
                                     {% endif %}
                                 </td>
                                 <td class="p-3">{{ article.listen_count or 0 }}</td>
-                                <td class="p-3">
-                                    <audio controls>
-                                        <source src="{{ article.audio_url }}" type="audio/mp3">
-                                        Your browser does not support the audio element.
-                                    </audio>
-                                </td>
+                                <td class="p-3">{{ article.voice_name or "Default" }}</td>
                                 <td class="p-3 flex space-x-2">
                                     {% if article.id %}
                                         <a href="{{ url_for('main.article_detail', article_id=article.id) }}" class="text-blue-500 font-bold hover:underline dark:text-blue-400">View</a>
@@ -108,19 +101,53 @@
         <!-- Pagination Controls -->
         <div class="flex flex-wrap justify-center mt-6 space-x-2">
             {% if page > 1 %}
-                <a href="{{ url_for('main.processed_articles', page=1) }}" class="px-4 py-2 bg-blue-500 text-white rounded hover:bg-blue-600 dark:bg-blue-700 dark:hover:bg-blue-600">First</a>
                 <a href="{{ url_for('main.processed_articles', page=page-1) }}" class="px-4 py-2 bg-blue-500 text-white rounded hover:bg-blue-600 dark:bg-blue-700 dark:hover:bg-blue-600">Previous</a>
             {% endif %}
             <span class="px-4 py-2">Page {{ page }} of {{ total_pages }}</span>
             {% if page < total_pages %}
                 <a href="{{ url_for('main.processed_articles', page=page+1) }}" class="px-4 py-2 bg-blue-500 text-white rounded hover:bg-blue-600 dark:bg-blue-700 dark:hover:bg-blue-600">Next</a>
-                <a href="{{ url_for('main.processed_articles', page=total_pages) }}" class="px-4 py-2 bg-blue-500 text-white rounded hover:bg-blue-600 dark:bg-blue-700 dark:hover:bg-blue-600">Last</a>
             {% endif %}
         </div>
     </div>
 
     <script>
-        // JavaScript remains the same as before.
+        const darkModeToggle = document.getElementById("dark-mode-toggle");
+
+        if (localStorage.getItem("dark-mode") === "true") {
+            document.documentElement.classList.add("dark");
+            darkModeToggle.checked = true;
+        }
+
+        document.addEventListener("DOMContentLoaded", () => {
+            const isDarkMode = localStorage.getItem("dark-mode") === "true";
+            if (isDarkMode) document.documentElement.classList.add("dark");
+            darkModeToggle.checked = isDarkMode;
+
+            darkModeToggle.addEventListener("change", () => {
+                document.documentElement.classList.toggle("dark", darkModeToggle.checked);
+                localStorage.setItem("dark-mode", darkModeToggle.checked);
+            });
+        });
+
+        $(document).ready(function () {
+            const table = $('#articles-table').DataTable({
+                paging: true,
+                info: true,
+                order: [[4, "desc"]],
+                columnDefs: [{ orderable: false, targets: [5, 6, 7, 8] }]
+            });
+
+            const filterInput = $('#hashtag-filter');
+            $('.hashtag-filter-item').on('click', function () {
+                const hashtag = $(this).data('hashtag');
+                filterInput.val(`#${hashtag}`);
+                table.search(`#${hashtag}`).draw();
+            });
+
+            filterInput.on('input', function () {
+                table.search(this.value).draw();
+            });
+        });
     </script>
 </body>
 

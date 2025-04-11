@@ -18,9 +18,7 @@ from .file_management import (
     extract_metadata,
 )
 
-
 def get_paginated_articles(page: int = 1, per_page: int = 10):
-    """Fetches and paginates processed articles from Firestore."""
     try:
         all_articles = get_all_articles()
         total_articles = len(all_articles)
@@ -29,7 +27,6 @@ def get_paginated_articles(page: int = 1, per_page: int = 10):
         end = start + per_page
         paginated_articles = all_articles[start:end]
 
-        # Add listen count and hashtag information to each article
         articles_with_listens = [
             {
                 "id": article.get("id"),
@@ -41,9 +38,9 @@ def get_paginated_articles(page: int = 1, per_page: int = 10):
                 "download_link": article.get("download_link", "#"),
                 "authors": article.get("authors", "Unknown Author"),
                 "hashtags": article.get("hashtags", []),
-                "listen_count": log_listen_event(article.get("id", ""), count_only=True)
-                if article.get("id")
-                else 0,
+                "voice_name": article.get("voice_name", "Default"),
+                "audio_length": article.get("audio_length"),
+                "listen_count": log_listen_event(article.get("id", ""), count_only=True) if article.get("id") else 0,
             }
             for article in paginated_articles
         ]
@@ -57,41 +54,37 @@ def get_paginated_articles(page: int = 1, per_page: int = 10):
         logging.error(f"Error loading processed articles: {e}")
         return None
 
-
-def process_article(url: str, hashtags: list = None) -> str:
-    """Processes a URL by extracting text, converting it to audio, uploading, and saving metadata."""
+def process_article(url: str, hashtags: list = None, voice_name: str = None) -> str:
     try:
         logging.info(f"Processing article for URL: {url}")
 
-        # Validate URL
         if not validate_url(url):
             raise ValueError(f"Invalid URL: {url}")
 
-        # Check if article is already processed
         existing_article = get_article_by_url(url)
         if existing_article:
             logging.info(f"Article already processed: {url}")
             return existing_article["download_link"]
 
-        # Extract text and metadata
         article_data = extract_text_from_url(url)
         if not article_data.get("text"):
             raise ValueError("No text content found at the provided URL.")
 
-        # Generate file path
         downloads_directory = "downloads"
         create_directory_if_not_exists(downloads_directory)
         audio_file_path = generate_audio_file_path(article_data, downloads_directory)
 
-        # Convert text to audio
         logging.info("Converting text to audio.")
-        text_to_speech(article_data["text"], audio_file_path)
+        audio_length = text_to_speech(
+            article_data["text"],
+            audio_file_path,
+            metadata=article_data,
+            voice_name=voice_name
+        )
 
-        # Upload to cloud storage
         logging.info(f"Uploading {audio_file_path} to Google Cloud Storage.")
         download_link = upload_to_gcs(audio_file_path, os.path.basename(audio_file_path))
 
-        # Save metadata to Firestore
         logging.info("Saving metadata to Firestore.")
         metadata = extract_metadata(article_data)
         save_article_metadata(
@@ -103,6 +96,8 @@ def process_article(url: str, hashtags: list = None) -> str:
             authors=metadata["authors"],
             text_content=article_data["text"],
             hashtags=hashtags or [],
+            voice_name=voice_name,
+            audio_length=round(audio_length, 2)
         )
 
         return download_link
@@ -111,9 +106,7 @@ def process_article(url: str, hashtags: list = None) -> str:
         logging.error(traceback.format_exc())
         raise
 
-
-def process_multiple_articles(urls: list, hashtags: list = None) -> list:
-    """Processes multiple URLs into audio and returns their statuses."""
+def process_multiple_articles(urls: list, hashtags: list = None, voice_name: str = None) -> list:
     results = []
     for url in urls:
         if not validate_url(url):
@@ -122,33 +115,27 @@ def process_multiple_articles(urls: list, hashtags: list = None) -> list:
             continue
 
         try:
-            download_link = process_article(url, hashtags=hashtags)
+            download_link = process_article(url, hashtags=hashtags, voice_name=voice_name)
             results.append({"url": url, "status": "Success", "download_link": download_link})
         except Exception as e:
             logging.error(f"Failed to process {url}: {e}")
             results.append({"url": url, "status": "Failed", "error": str(e)})
     return results
 
-
 def validate_url(url: str) -> bool:
-    """Validates if the URL has a proper format."""
     parsed_url = urlparse(url)
     is_valid = bool(parsed_url.scheme and parsed_url.netloc)
     if not is_valid:
         logging.warning(f"Invalid URL provided: {url}")
     return is_valid
 
-
 def preview_article_metadata(url: str) -> dict:
-    """Preview metadata for a URL before processing."""
     try:
         logging.info(f"Previewing metadata for URL: {url}")
 
-        # Validate URL
         if not validate_url(url):
             raise ValueError(f"Invalid URL: {url}")
 
-        # Extract metadata
         article_data = extract_text_from_url(url)
         if not article_data.get("text"):
             raise ValueError("No text content found at the provided URL.")

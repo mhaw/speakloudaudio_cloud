@@ -1,0 +1,53 @@
+version: '3.8'
+
+services:
+  speakloudaudio:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: speakloudaudio_cloud:latest
+    container_name: speakloudaudio_cloud
+    ports:
+      - "5000:5000"
+    environment:
+      # App and Google Cloud credentials
+      GOOGLE_APPLICATION_CREDENTIALS: "/app/speakloudaudio-7a34eeceb530.json"
+      GCS_BUCKET_NAME: "speakloudaudio"
+      
+      # Text-to-Speech Configuration
+      TTS_LANGUAGE_CODE: "en-US"
+      TTS_VOICE_GENDER: "NEUTRAL"
+
+      # Flask App Configuration
+      SECRET_KEY: "${SECRET_KEY:-your_default_secret_key}"
+
+      # Firestore Configuration
+      FIRESTORE_PROJECT_ID: "${FIRESTORE_PROJECT_ID:-your_project_id}"
+
+      # Logging
+      LOG_LEVEL: "INFO"
+
+    volumes:
+      - ./data:/app/data
+      - ./speakloudaudio-7a34eeceb530.json:/app/speakloudaudio-7a34eeceb530.json:ro
+
+    networks:
+      - speakloud_network
+
+    # Health check for the container
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:5000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+    restart: unless-stopped
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+networks:
+  speakloud_network:
+    driver: bridge

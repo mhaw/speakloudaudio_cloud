@@ -1,0 +1,164 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>SpeakLoudAudio</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <link rel="stylesheet" href="{{ url_for('static', filename='css/styles.css') }}">
+</head>
+
+<body class="bg-gray-100 text-gray-900 dark:bg-gray-900 dark:text-gray-100">
+    <div class="container mx-auto p-6 bg-white dark:bg-gray-800 rounded-lg shadow-lg">
+        <header class="mb-8 text-center">
+            <h1 class="text-4xl font-bold mb-4 text-blue-500 dark:text-blue-400">SpeakLoudAudio</h1>
+            <p class="text-lg mb-6">Convert article text into audio instantly.</p>
+            <nav class="mb-6">
+                <a href="{{ url_for('main.processed_articles') }}"
+                    class="px-6 py-3 bg-blue-500 text-white rounded hover:bg-blue-600 dark:bg-blue-700 dark:hover:bg-blue-600">
+                    View Converted Files
+                </a>
+            </nav>
+        </header>
+
+        <!-- Dark Mode Toggle -->
+        <div class="flex justify-center items-center mb-8">
+            <label for="dark-mode-toggle" class="mr-2 text-sm">Dark Mode</label>
+            <input type="checkbox" id="dark-mode-toggle" class="hidden">
+            <span class="toggle-slider cursor-pointer relative w-10 h-5 bg-gray-300 dark:bg-gray-600 rounded-full">
+                <span class="absolute left-1 top-1 w-3 h-3 bg-white dark:bg-gray-300 rounded-full transform transition-transform duration-300"></span>
+            </span>
+        </div>
+
+        <!-- URL Submission Form -->
+        <main>
+            <form id="url-form" method="POST" class="mb-8 max-w-xl mx-auto">
+                <!-- Article URL Input -->
+                <label for="url-input" class="block text-sm font-semibold mb-2">Article URL</label>
+                <input 
+                    type="url" 
+                    id="url-input" 
+                    name="url" 
+                    placeholder="e.g., https://example.com/article" 
+                    required 
+                    autofocus 
+                    class="w-full p-4 mb-4 border border-gray-300 dark:border-gray-600 rounded focus:outline-none focus:border-blue-500 dark:focus:border-blue-400 bg-white dark:bg-gray-700 text-black dark:text-white">
+
+                <!-- Hashtags Input -->
+                <label for="hashtags" class="block text-sm font-semibold mb-2">Hashtags (comma-separated)</label>
+                <input 
+                    type="text" 
+                    id="hashtags" 
+                    name="hashtags" 
+                    placeholder="e.g., technology, news, audio" 
+                    class="w-full p-4 mb-6 border border-gray-300 dark:border-gray-600 rounded focus:outline-none focus:border-blue-500 dark:focus:border-blue-400 bg-white dark:bg-gray-700 text-black dark:text-white">
+
+                <!-- Submit Button -->
+                <button 
+                    type="submit" 
+                    class="w-full px-4 py-3 bg-blue-500 text-white rounded hover:bg-blue-600 dark:bg-blue-700 dark:hover:bg-blue-600">
+                    Generate Audio
+                </button>
+            </form>
+
+            <!-- Feedback Section -->
+            <div id="feedback" class="max-w-xl mx-auto p-4 hidden text-center bg-gray-100 dark:bg-gray-700 text-gray-700 dark:text-gray-100 rounded"></div>
+
+            <!-- Spinner -->
+            <div id="loading-spinner" class="text-center mb-8 hidden">
+                <p class="mb-4">Processing...</p>
+                <div class="spinner border-t-4 border-blue-500 rounded-full w-12 h-12 animate-spin mx-auto"></div>
+            </div>
+
+            <!-- Recently Processed File -->
+            <section id="recently-processed" class="hidden max-w-xl mx-auto mt-8 p-6 bg-gray-100 dark:bg-gray-700 rounded-lg">
+                <h2 class="text-2xl font-semibold mb-4 text-gray-900 dark:text-gray-100">Recently Processed</h2>
+                <div>
+                    <audio controls class="w-full">
+                        <source id="recent-audio-source" src="" type="audio/mp3">
+                        Your browser does not support the audio element.
+                    </audio>
+                    <p class="mt-2">
+                        <a id="details-link" href="#" class="text-blue-500 hover:underline dark:text-blue-300"></a>
+                    </p>
+                </div>
+            </section>
+        </main>
+    </div>
+
+    <footer class="mt-12 text-center">
+        <p class="text-gray-600 dark:text-gray-400 mb-2">© 2024 SpeakLoudAudio. All rights reserved.</p>
+        <p class="text-gray-600 dark:text-gray-400">
+            <a href="/about" class="hover:underline">About Us</a> |
+            <a href="/contact" class="hover:underline">Contact</a>
+        </p>
+    </footer>
+
+    <script>
+        // Dark mode toggle
+        const darkModeToggle = document.getElementById("dark-mode-toggle");
+        if (localStorage.getItem("dark-mode") === "true") {
+            document.documentElement.classList.add("dark");
+            darkModeToggle.checked = true;
+        }
+
+        darkModeToggle.addEventListener("change", () => {
+            document.documentElement.classList.toggle("dark", darkModeToggle.checked);
+            localStorage.setItem("dark-mode", darkModeToggle.checked);
+        });
+
+        // Form submission with feedback, spinner, and dynamic update
+        document.getElementById("url-form").onsubmit = async (event) => {
+            event.preventDefault(); // Prevent default form submission
+            const form = event.target;
+            const url = form.querySelector("#url-input").value;
+            const hashtags = form.querySelector("#hashtags").value;
+
+            // UI elements
+            const feedback = document.getElementById("feedback");
+            const spinner = document.getElementById("loading-spinner");
+            const button = form.querySelector("button[type=submit]");
+            const recentlyProcessed = document.getElementById("recently-processed");
+            const audioSource = document.getElementById("recent-audio-source");
+            const detailsLink = document.getElementById("details-link");
+            
+            // Update UI for processing
+            feedback.classList.add("hidden");
+            spinner.classList.remove("hidden");
+            button.textContent = "Processing...";
+            button.disabled = true;
+
+            try {
+                const response = await fetch("/process_article", {
+                    method: "POST",
+                    headers: { "Content-Type": "application/x-www-form-urlencoded" },
+                    body: new URLSearchParams({ url, hashtags }),
+                });
+
+                if (response.ok) {
+                    const result = await response.json();
+                    // Display the recently processed file
+                    audioSource.src = result.audio_url;
+                    detailsLink.href = result.details_url;
+                    detailsLink.textContent = "View Details";
+                    recentlyProcessed.classList.remove("hidden");
+                    feedback.classList.add("hidden");
+                } else {
+                    const result = await response.json();
+                    feedback.textContent = result.message || "An error occurred. Please try again.";
+                    feedback.classList.remove("hidden");
+                }
+            } catch (error) {
+                feedback.textContent = "An unexpected error occurred. Please try again.";
+                feedback.classList.remove("hidden");
+            } finally {
+                spinner.classList.add("hidden");
+                button.textContent = "Generate Audio";
+                button.disabled = false;
+            }
+        };
+    </script>
+</body>
+
+</html>

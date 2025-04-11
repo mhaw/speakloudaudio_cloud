@@ -1,0 +1,1583 @@
+
+==================== Python Files ====================
+
+[File: /home/mhaw/speakloudaudio_cloud/app/text_to_speech_service.py]
+import logging
+import tempfile
+import os
+import re
+import time
+from google.cloud import texttospeech
+from pydub import AudioSegment
+from typing import List, Dict, Optional
+
+class TTSConversionError(Exception):
+    """Custom exception for Text-to-Speech conversion errors."""
+    pass
+
+def split_text_by_bytes(text: str, max_bytes: int = 5000) -> List[str]:
+    """Splits text into chunks that fit within a byte limit for TTS processing."""
+    chunks, current_chunk = [], ""
+    for sentence in re.split(r'(?<=[.!?]) +', text):
+        sentence_bytes = len(sentence.encode('utf-8'))
+        if len(current_chunk.encode('utf-8')) + sentence_bytes <= max_bytes:
+            current_chunk += sentence + " "
+        else:
+            chunks.append(current_chunk.strip())
+            current_chunk = sentence + " "
+    if current_chunk:
+        chunks.append(current_chunk.strip())
+    logging.info(f"Split text into {len(chunks)} chunks.")
+    return chunks
+
+def format_metadata_text(metadata: Dict[str, str]) -> str:
+    """Formats metadata text into a readable intro for the audio."""
+    return (
+        f"Title: {metadata.get('title', 'Unknown Title')}. "
+        f"Source: {metadata.get('source', 'Unknown Source')}. "
+        f"Author(s): {metadata.get('authors', 'Unknown Author')}. "
+        f"Published on: {metadata.get('publish_date', 'Unknown Date')}."
+    )
+
+def synthesize_text_chunk(
+    chunk: str,
+    client: texttospeech.TextToSpeechClient,
+    voice: texttospeech.VoiceSelectionParams,
+    audio_config: texttospeech.AudioConfig,
+    retries: int = 3
+) -> str:
+    """Helper function to synthesize a text chunk with retries and save it to a temporary file."""
+    for attempt in range(retries):
+        try:
+            synthesis_input = texttospeech.SynthesisInput(text=chunk)
+            response = client.synthesize_speech(input=synthesis_input, voice=voice, audio_config=audio_config)
+
+            # Write the audio content to a temporary file
+            temp_file = tempfile.NamedTemporaryFile(delete=False, suffix=".mp3")
+            temp_file.write(response.audio_content)
+            temp_file.close()
+            return temp_file.name
+
+        except Exception as e:
+            if attempt < retries - 1:
+                backoff_time = 2 ** attempt
+                logging.warning(f"Retry {attempt + 1}/{retries} for chunk due to error: {e}. Backing off for {backoff_time} seconds.")
+                time.sleep(backoff_time)
+            else:
+                logging.error(f"Final attempt failed for chunk: {e}")
+                raise TTSConversionError(f"Failed to synthesize chunk after {retries} attempts.")
+
+def text_to_speech(
+    text: str,
+    output_file: str,
+    metadata: Dict[str, str],
+    language_code: str = "en-US",
+    gender: texttospeech.SsmlVoiceGender = texttospeech.SsmlVoiceGender.NEUTRAL,
+    voice_name: Optional[str] = None,
+    retries: int = 3
+) -> None:
+    """Converts text to speech in chunks, adds metadata as an intro, and saves as a single MP3 file."""
+    client = texttospeech.TextToSpeechClient()
+    voice = texttospeech.VoiceSelectionParams(
+        language_code=language_code,
+        ssml_gender=gender,
+        name=voice_name if voice_name else None
+    )
+    audio_config = texttospeech.AudioConfig(audio_encoding=texttospeech.AudioEncoding.MP3)
+
+    # Use the metadata formatter to create an intro
+    intro_text = format_metadata_text(metadata)
+
+    # Combine intro with main text and split into manageable chunks
+    full_text = intro_text + " " + text
+    text_chunks = split_text_by_bytes(full_text)
+    temp_files = []
+
+    try:
+        for i, chunk in enumerate(text_chunks):
+            temp_file_path = synthesize_text_chunk(chunk, client, voice, audio_config, retries)
+            temp_files.append(temp_file_path)
+            logging.info(f"Generated audio for chunk {i + 1}/{len(text_chunks)}")
+
+        # Concatenate all audio chunks into the final file
+        combined_audio = AudioSegment.empty()
+        for temp_file_path in temp_files:
+            combined_audio += AudioSegment.from_mp3(temp_file_path)
+
+        # Normalize audio to ensure consistent volume levels
+        combined_audio = combined_audio.normalize()
+        combined_audio.export(output_file, format="mp3")
+        logging.info(f"Concatenated audio saved as: {output_file}")
+
+    except TTSConversionError as e:
+        logging.error(f"Error during text-to-speech conversion: {e}")
+        raise
+    finally:
+        # Clean up temporary files
+        for temp_file in temp_files:
+            if os.path.exists(temp_file):
+                os.remove(temp_file)
+                logging.info(f"Deleted temporary file: {temp_file}")
+
+[File: /home/mhaw/speakloudaudio_cloud/app/services.py]
+import logging
+import traceback
+import os
+from urllib.parse import urlparse
+from flask import render_template, request, redirect, url_for, flash
+from app.firestore_database_operations import (
+    get_all_articles,
+    save_article_metadata,
+    get_article_by_url,
+)
+from app.firestore_utils import log_listen_event
+from .text_extraction import extract_text_from_url
+from .text_to_speech_service import text_to_speech
+from .cloud_storage import upload_to_gcs
+from .file_management import (
+    generate_audio_file_path,
+    create_directory_if_not_exists,
+    extract_metadata,
+)
+
+
+def get_paginated_articles(page: int = 1, per_page: int = 10):
+    """Fetches and paginates processed articles from Firestore."""
+    try:
+        all_articles = get_all_articles()
+        total_articles = len(all_articles)
+        total_pages = (total_articles + per_page - 1) // per_page
+        start = (page - 1) * per_page
+        end = start + per_page
+        paginated_articles = all_articles[start:end]
+
+        # Add listen count and hashtag information to each article
+        articles_with_listens = [
+            {
+                "id": article.get("id"),
+                "title": article.get("title", "Unknown Title"),
+                "source": article.get("source", "Unknown Source"),
+                "url": article.get("url", "#"),
+                "publish_date": article.get("publish_date", "Unknown Date"),
+                "processed_date": article.get("processed_date", "Unknown Date"),
+                "download_link": article.get("download_link", "#"),
+                "authors": article.get("authors", "Unknown Author"),
+                "hashtags": article.get("hashtags", []),
+                "listen_count": log_listen_event(article.get("id", ""), count_only=True)
+                if article.get("id")
+                else 0,
+            }
+            for article in paginated_articles
+        ]
+
+        return {
+            "articles": articles_with_listens,
+            "page": page,
+            "total_pages": total_pages,
+        }
+    except Exception as e:
+        logging.error(f"Error loading processed articles: {e}")
+        return None
+
+
+def process_article(url: str, hashtags: list = None) -> str:
+    """Processes a URL by extracting text, converting it to audio, uploading, and saving metadata."""
+    try:
+        logging.info(f"Processing article for URL: {url}")
+
+        # Validate URL
+        if not validate_url(url):
+            raise ValueError(f"Invalid URL: {url}")
+
+        # Check if article is already processed
+        existing_article = get_article_by_url(url)
+        if existing_article:
+            logging.info(f"Article already processed: {url}")
+            return existing_article["download_link"]
+
+        # Extract text and metadata
+        article_data = extract_text_from_url(url)
+        if not article_data.get("text"):
+            raise ValueError("No text content found at the provided URL.")
+
+        # Generate file path
+        downloads_directory = "downloads"
+        create_directory_if_not_exists(downloads_directory)
+        audio_file_path = generate_audio_file_path(article_data, downloads_directory)
+
+        # Convert text to audio
+        logging.info("Converting text to audio.")
+        text_to_speech(article_data["text"], audio_file_path)
+
+        # Upload to cloud storage
+        logging.info(f"Uploading {audio_file_path} to Google Cloud Storage.")
+        download_link = upload_to_gcs(audio_file_path, os.path.basename(audio_file_path))
+
+        # Save metadata to Firestore
+        logging.info("Saving metadata to Firestore.")
+        metadata = extract_metadata(article_data)
+        save_article_metadata(
+            title=metadata["title"],
+            source=metadata["source"],
+            url=url,
+            publish_date=metadata["publish_date"],
+            download_link=download_link,
+            authors=metadata["authors"],
+            text_content=article_data["text"],
+            hashtags=hashtags or [],
+        )
+
+        return download_link
+    except Exception as e:
+        logging.error(f"Error processing article: {e}")
+        logging.error(traceback.format_exc())
+        raise
+
+
+def process_multiple_articles(urls: list, hashtags: list = None) -> list:
+    """Processes multiple URLs into audio and returns their statuses."""
+    results = []
+    for url in urls:
+        if not validate_url(url):
+            logging.warning(f"Invalid URL skipped: {url}")
+            results.append({"url": url, "status": "Failed", "error": "Invalid URL"})
+            continue
+
+        try:
+            download_link = process_article(url, hashtags=hashtags)
+            results.append({"url": url, "status": "Success", "download_link": download_link})
+        except Exception as e:
+            logging.error(f"Failed to process {url}: {e}")
+            results.append({"url": url, "status": "Failed", "error": str(e)})
+    return results
+
+
+def validate_url(url: str) -> bool:
+    """Validates if the URL has a proper format."""
+    parsed_url = urlparse(url)
+    is_valid = bool(parsed_url.scheme and parsed_url.netloc)
+    if not is_valid:
+        logging.warning(f"Invalid URL provided: {url}")
+    return is_valid
+
+
+def preview_article_metadata(url: str) -> dict:
+    """Preview metadata for a URL before processing."""
+    try:
+        logging.info(f"Previewing metadata for URL: {url}")
+
+        # Validate URL
+        if not validate_url(url):
+            raise ValueError(f"Invalid URL: {url}")
+
+        # Extract metadata
+        article_data = extract_text_from_url(url)
+        if not article_data.get("text"):
+            raise ValueError("No text content found at the provided URL.")
+
+        metadata = extract_metadata(article_data)
+        return {
+            "title": metadata.get("title", "Unknown Title"),
+            "source": metadata.get("source", "Unknown Source"),
+            "publish_date": metadata.get("publish_date", "Unknown Date"),
+            "authors": metadata.get("authors", "Unknown Author"),
+        }
+    except Exception as e:
+        logging.error(f"Error previewing article metadata: {e}")
+        raise
+
+[File: /home/mhaw/speakloudaudio_cloud/app/file_management.py]
+import os
+import re
+import logging
+from datetime import datetime
+from urllib.parse import urlparse
+from typing import Optional, Dict, Union
+
+# Limit for filename length to ensure compatibility with most filesystems.
+FILENAME_LENGTH_LIMIT = 255
+
+# Mapping for more human-readable source names based on domain.
+SOURCE_NAME_MAPPING = {
+    "theatlantic.com": "The_Atlantic",
+    "newyorker.com": "The_New_Yorker",
+    "washingtonpost.com": "Washington_Post",
+    "defector.com": "Defector",
+    "nytimes.com": "New_York_Times",
+    "bbc.com": "BBC",
+}
+
+def get_human_readable_source(url: str) -> str:
+    """Extracts a human-readable source name from the URL."""
+    domain = urlparse(url).netloc.replace("www.", "").lower()
+    return SOURCE_NAME_MAPPING.get(domain, re.sub(r'[^a-zA-Z0-9]+', '_', domain).title())
+
+def sanitize_title(title: str, limit: int = 50) -> str:
+    """Sanitizes the title to be a valid filename by replacing invalid characters and limiting length."""
+    sanitized = re.sub(r'[^a-zA-Z0-9]+', '_', title).strip('_')
+    return sanitized[:limit]  # Limit the length to ensure filenames are not too long.
+
+def sanitize_filename(filename: str) -> str:
+    """Truncates and sanitizes a filename to fit within file system constraints."""
+    return filename[:FILENAME_LENGTH_LIMIT]
+
+def generate_audio_file_name(article_metadata: Dict[str, str], directory: str = "downloads") -> str:
+    """Generates a unique filename for the audio file based on the article metadata."""
+    # Get or generate publish date
+    publish_date = article_metadata.get("publish_date", datetime.now().strftime("%Y_%m_%d"))
+
+    # Extract source and title, sanitize them for filename safety, and truncate them to reasonable lengths.
+    source_url = article_metadata.get("source", "")
+    source = get_human_readable_source(source_url)
+    title = sanitize_title(article_metadata.get("title", "title_unknown"), limit=50)
+
+    # Create a base name for the file
+    base_name = f"{publish_date}_{source[:20]}_{title}".lower()
+    filename = sanitize_filename(f"{base_name}.mp3")
+
+    # Ensure the filename is unique by appending a counter if needed.
+    counter = 1
+    while os.path.exists(os.path.join(directory, filename)):
+        filename = sanitize_filename(f"{base_name}_{counter}.mp3")
+        counter += 1
+
+    return filename
+
+def generate_audio_file_path(article_metadata: Dict[str, str], directory: str = "downloads") -> str:
+    """Generates the complete file path for the audio file."""
+    create_directory_if_not_exists(directory)  # Ensure the directory exists
+    filename = generate_audio_file_name(article_metadata, directory)
+    return os.path.join(directory, filename)
+
+def create_directory_if_not_exists(directory: str) -> None:
+    """Creates the directory if it does not exist."""
+    try:
+        os.makedirs(directory, exist_ok=True)
+        logging.info(f"Directory '{directory}' is ready.")
+    except Exception as e:
+        logging.error(f"Failed to create directory '{directory}': {e}")
+        raise OSError(f"Failed to create directory {directory}: {e}")
+
+def extract_metadata(article_metadata: Dict[str, Union[str, list]]) -> Dict[str, str]:
+    """Extracts and formats additional metadata from the article."""
+    # Extract the first author, or set to 'Unknown Author' if none is provided
+    authors_list = article_metadata.get("authors", [])
+    first_author = authors_list[0] if authors_list else "Unknown Author"
+
+    # Handle date formatting if the publish date is a datetime object
+    publish_date = article_metadata.get("publish_date", "Unknown Date")
+    if isinstance(publish_date, datetime):
+        publish_date = publish_date.strftime("%Y-%m-%d")
+
+    return {
+        "title": article_metadata.get("title", "Unknown Title"),
+        "source": get_human_readable_source(article_metadata.get("source", "")),
+        "publish_date": publish_date,
+        "authors": first_author
+    }
+
+def is_valid_path(directory: str) -> bool:
+    """Checks if a directory path is valid."""
+    try:
+        if not os.path.exists(directory):
+            os.makedirs(directory, exist_ok=True)
+        return True
+    except Exception as e:
+        logging.error(f"Invalid directory path '{directory}': {e}")
+        return False
+
+def clean_metadata_string(value: Optional[str], default: str = "Unknown") -> str:
+    """Cleans a metadata value by ensuring it is a string and not empty."""
+    if not value or not isinstance(value, str):
+        return default
+    return value.strip()[:FILENAME_LENGTH_LIMIT]  # Ensure value length is within limits
+
+def validate_article_metadata(article_metadata: Dict[str, Union[str, list]]) -> bool:
+    """Validates the article metadata for essential fields."""
+    required_fields = ["title", "source"]
+    for field in required_fields:
+        if field not in article_metadata or not article_metadata[field]:
+            logging.warning(f"Article metadata missing required field: {field}")
+            return False
+    return True
+
+[File: /home/mhaw/speakloudaudio_cloud/app/firestore_utils.py]
+import datetime
+import logging
+from google.cloud import firestore
+
+# Firestore client
+firestore_client = firestore.Client()
+
+def log_listen_event(article_id: str, count_only=False) -> int:
+    """Logs a listen event or returns the listen count for a given article ID.
+    
+    Args:
+        article_id (str): The ID of the article to log or count listens for.
+        count_only (bool): If True, returns the listen count without logging.
+
+    Returns:
+        int: Listen count if `count_only` is True, else returns 1 on success, 0 on failure.
+    """
+    try:
+        article_ref = firestore_client.collection("articles").document(article_id)
+        listens_ref = article_ref.collection("listens")
+
+        if count_only:
+            listen_count = sum(1 for _ in listens_ref.stream())  # Efficiently count listens
+            logging.info(f"Listen count retrieved for article ID {article_id}: {listen_count}")
+            return listen_count
+        else:
+            listen_data = {
+                "listen_date": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            }
+            listens_ref.add(listen_data)
+            logging.info(f"Listen event logged for article ID: {article_id}")
+            return 1
+    except Exception as e:
+        logging.error(f"Firestore error in log_listen_event: {e}")
+        return 0
+
+def get_article_id_by_filename(filename: str) -> str:
+    """Fetches the article ID based on the audio filename.
+    
+    Args:
+        filename (str): The filename used to find the article.
+
+    Returns:
+        str: The article ID if found, else None.
+    """
+    try:
+        articles_ref = firestore_client.collection("articles")
+        query = articles_ref.where("download_link", "==", filename).limit(1).stream()
+        article = next(query, None)
+        if article:
+            logging.info(f"Article ID fetched for filename: {filename}")
+            return article.id
+        else:
+            logging.warning(f"Article not found for filename: {filename}")
+            return None
+    except Exception as e:
+        logging.error(f"Firestore error in get_article_id_by_filename: {e}")
+        return None
+
+def format_date(date_string: str, format_string: str = "%Y-%m-%d") -> str:
+    """Formats a date string into a specified format.
+    
+    Args:
+        date_string (str): The date string to format.
+        format_string (str): The format to convert to (default is "%Y-%m-%d").
+
+    Returns:
+        str: The formatted date string, or the original if an error occurs.
+    """
+    try:
+        date_obj = datetime.datetime.strptime(date_string, "%Y-%m-%d")
+        return date_obj.strftime(format_string)
+    except ValueError as e:
+        logging.error(f"Date formatting error: {e}")
+        return date_string  # Return the original string if there's an error
+
+def get_recent_activity(article_id: str, limit: int = 5) -> list:
+    """Fetches recent listen events for a given article ID, limited to the specified number.
+    
+    Args:
+        article_id (str): The ID of the article.
+        limit (int): Number of recent events to fetch (default is 5).
+
+    Returns:
+        list: List of recent listen events, each as a dictionary.
+    """
+    try:
+        article_ref = firestore_client.collection("articles").document(article_id)
+        listens_ref = article_ref.collection("listens").order_by("listen_date", direction=firestore.Query.DESCENDING).limit(limit)
+        listens = listens_ref.stream()
+        recent_activity = [{"listen_date": listen.to_dict().get("listen_date")} for listen in listens]
+        logging.info(f"Fetched {len(recent_activity)} recent listen events for article ID {article_id}")
+        return recent_activity
+    except Exception as e:
+        logging.error(f"Firestore error in get_recent_activity: {e}")
+        return []
+
+def log_error(error_message: str):
+    """Logs an error message for troubleshooting.
+    
+    Args:
+        error_message (str): The error message to log.
+    """
+    logging.error(f"App error: {error_message}")
+
+[File: /home/mhaw/speakloudaudio_cloud/app/cloud_storage.py]
+import os
+import logging
+import traceback
+import time
+from google.cloud import storage
+from typing import Optional
+
+class UploadError(Exception):
+    pass
+
+def upload_to_gcs(local_path: str, filename: str, retries: int = 3) -> Optional[str]:
+    """Uploads a file to Google Cloud Storage, with retry logic."""
+    bucket_name = os.getenv("GCS_BUCKET_NAME")
+    if not bucket_name:
+        logging.error("GCS_BUCKET_NAME environment variable is not set.")
+        raise EnvironmentError("GCS_BUCKET_NAME is required.")
+    
+    try:
+        storage_client = storage.Client()
+        bucket = storage_client.bucket(bucket_name)
+        blob = bucket.blob(filename)
+        
+        logging.info(f"Uploading {filename} to Google Cloud Storage...")
+        for attempt in range(retries):
+            try:
+                blob.upload_from_filename(local_path)
+                logging.info(f"File {filename} successfully uploaded.")
+                return blob.public_url
+            except (storage.exceptions.GoogleAPIError, storage.exceptions.RetryError) as e:
+                if attempt < retries - 1:
+                    backoff_time = 2 ** attempt  # Exponential backoff
+                    logging.warning(f"Retrying upload in {backoff_time} seconds... Attempt {attempt + 1}")
+                    time.sleep(backoff_time)
+                else:
+                    logging.error(f"Upload failed after {retries} attempts.")
+                    logging.error(traceback.format_exc())
+                    raise UploadError(f"Failed to upload {filename} to Google Cloud Storage.")
+    except Exception as e:
+        logging.error(f"Unexpected error uploading file to GCS: {e}")
+        logging.error(traceback.format_exc())
+        raise
+
+[File: /home/mhaw/speakloudaudio_cloud/app/__init__.py]
+from flask import Flask
+from config import Config
+
+
+def create_app():
+    app = Flask(__name__, static_folder="static", template_folder="templates")
+    app.config.from_object(Config)
+
+    # Initialize database before registering routes
+    initialize_database()
+
+    # Register Blueprints
+    from .routes import main
+    app.register_blueprint(main)
+
+    return app
+[File: /home/mhaw/speakloudaudio_cloud/app/text_extraction.py]
+import datetime
+import logging
+import time
+from newspaper import Article, Config
+from bs4 import BeautifulSoup
+from typing import Dict, Any
+import requests
+from requests.exceptions import HTTPError, RequestException
+
+# Custom User-Agent header to avoid bot detection
+HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36",
+    "Referer": "https://www.google.com/",
+    "Accept-Language": "en-US,en;q=0.9",
+}
+
+def extract_text_from_url(url: str, retries: int = 3, backoff_factor: int = 2) -> Dict[str, Any]:
+    """
+    Extracts article text, title, and author information from the provided URL.
+    Returns a dictionary containing the text and metadata.
+    Retries extraction with exponential backoff if it fails.
+    """
+    # Initialize article data with default values
+    article_data = {
+        "title": "Unknown Title",
+        "text": "",
+        "authors": ["Unknown Author"],
+        "publish_date": "Unknown Date",
+        "source": url
+    }
+
+    # Retry mechanism for transient errors
+    for attempt in range(retries):
+        try:
+            # Configuration to set up headers
+            user_agent_config = Config()
+            user_agent_config.browser_user_agent = HEADERS['User-Agent']
+            user_agent_config.request_timeout = 15  # Timeout for newspaper
+
+            # Attempt to extract using newspaper3k
+            article = Article(url, config=user_agent_config)
+            article.download()
+            article.parse()
+
+            # Extract and set article data, falling back to defaults if any are empty
+            article_data["title"] = article.title if article.title else "Unknown Title"
+            article_data["text"] = article.text if article.text else ""
+            article_data["authors"] = article.authors if article.authors else ["Unknown Author"]
+            if article.publish_date:
+                article_data["publish_date"] = article.publish_date.strftime("%Y-%m-%d")
+
+            logging.info(f"Successfully extracted article data from URL: {url}")
+            return article_data
+
+        except HTTPError as http_err:
+            logging.warning(f"HTTP error occurred on attempt {attempt + 1}/{retries} for URL {url}: {http_err}")
+        except RequestException as req_err:
+            logging.warning(f"Request error occurred on attempt {attempt + 1}/{retries} for URL {url}: {req_err}")
+        except Exception as e:
+            logging.error(f"An error occurred on attempt {attempt + 1}/{retries} for URL {url}: {e}")
+
+        # Exponential backoff
+        time.sleep(backoff_factor ** attempt)
+
+    # Fallback mechanism using requests and BeautifulSoup
+    try:
+        logging.info(f"Attempting fallback extraction using requests and BeautifulSoup for URL: {url}")
+        response = requests.get(url, headers=HEADERS, timeout=15)
+        response.raise_for_status()
+
+        soup = BeautifulSoup(response.content, 'html.parser')
+
+        # Extract title
+        title_tag = soup.find('title')
+        if title_tag:
+            article_data["title"] = title_tag.text.strip()
+
+        # Extract text from <p> tags
+        paragraphs = soup.find_all('p')
+        if paragraphs:
+            article_data["text"] = " ".join(p.get_text().strip() for p in paragraphs)
+
+        logging.info(f"Fallback extraction successful for URL: {url}")
+
+    except HTTPError as http_err:
+        logging.error(f"HTTP error occurred during fallback extraction for URL {url}: {http_err}")
+    except RequestException as req_err:
+        logging.error(f"Request error occurred during fallback extraction for URL {url}: {req_err}")
+    except Exception as e:
+        logging.error(f"Unexpected error during fallback extraction for URL {url}: {e}")
+
+    return article_data
+
+[File: /home/mhaw/speakloudaudio_cloud/app/firestore_database_operations.py]
+import datetime
+import logging
+import time
+from google.cloud import firestore
+from google.api_core.exceptions import GoogleAPICallError, RetryError
+
+# Firestore client
+firestore_client = firestore.Client()
+
+def retry_on_failure(max_retries=3, delay=2):
+    """Decorator for retrying Firestore operations in case of failure."""
+    def decorator(func):
+        def wrapper(*args, **kwargs):
+            retries = 0
+            while retries < max_retries:
+                try:
+                    return func(*args, **kwargs)
+                except (GoogleAPICallError, RetryError) as e:
+                    logging.warning(f"Retry {retries + 1}/{max_retries} for {func.__name__} due to error: {e}")
+                    retries += 1
+                    time.sleep(delay)
+            logging.error(f"Operation {func.__name__} failed after {max_retries} retries.")
+            raise
+        return wrapper
+    return decorator
+
+@retry_on_failure()
+def save_article_metadata(title, source, url, publish_date, download_link, authors="Unknown", text_content="", hashtags=[]):
+    """Saves metadata for a processed article into Firestore."""
+    try:
+        article_data = {
+            "title": title,
+            "source": source,
+            "url": url,
+            "publish_date": publish_date,
+            "processed_date": datetime.datetime.now().strftime("%Y-%m-%d"),
+            "download_link": download_link,
+            "authors": authors,
+            "text_content": text_content,
+            "hashtags": hashtags  # Add hashtags to the document
+        }
+        doc_ref = firestore_client.collection("articles").add(article_data)
+        logging.info(f"Article metadata saved for URL: {url} with hashtags: {hashtags}")
+        return doc_ref[1].id  # Returns the generated document ID
+    except Exception as e:
+        logging.error(f"Firestore error while saving article metadata: {e}")
+        raise
+
+@retry_on_failure()
+def get_all_articles():
+    """Fetches all articles from Firestore and returns them as dictionaries."""
+    try:
+        articles_ref = firestore_client.collection("articles")
+        articles = articles_ref.stream()
+        all_articles = [{**article.to_dict(), "id": article.id} for article in articles]
+        logging.info(f"Fetched {len(all_articles)} articles from Firestore.")
+        return all_articles
+    except Exception as e:
+        logging.error(f"Firestore error while retrieving all articles: {e}")
+        return []
+
+@retry_on_failure()
+def get_recent_articles(limit: int = 5) -> list:
+    """Fetches a limited number of recently processed articles."""
+    try:
+        articles_ref = firestore_client.collection("articles").order_by("processed_date", direction=firestore.Query.DESCENDING).limit(limit)
+        articles = articles_ref.stream()
+        return [{**article.to_dict(), "id": article.id} for article in articles]
+    except Exception as e:
+        logging.error(f"Firestore error during recent articles fetch: {e}")
+        return []
+
+@retry_on_failure()
+def update_article(article_id: str, update_data: dict):
+    """Updates specific fields of an article in Firestore."""
+    try:
+        article_ref = firestore_client.collection("articles").document(article_id)
+        article_ref.update(update_data)
+        logging.info(f"Article with ID {article_id} updated successfully with data: {update_data}")
+    except Exception as e:
+        logging.error(f"Firestore error while updating article metadata: {e}")
+        raise
+
+@retry_on_failure()
+def get_listen_count(article_id: str) -> int:
+    """Returns the listen count for a given article ID."""
+    try:
+        article_ref = firestore_client.collection("articles").document(article_id)
+        listens_ref = article_ref.collection("listens")
+        listen_count = sum(1 for _ in listens_ref.stream())
+        logging.info(f"Listen count for article ID {article_id}: {listen_count}")
+        return listen_count
+    except Exception as e:
+        logging.error(f"Firestore error while counting listens: {e}")
+        return 0
+
+@retry_on_failure()
+def get_article_by_id(article_id: str):
+    """Fetches an article from Firestore by its ID."""
+    try:
+        article_ref = firestore_client.collection("articles").document(article_id)
+        article = article_ref.get()
+        if article.exists:
+            logging.info(f"Article with ID {article_id} fetched successfully.")
+            return {**article.to_dict(), "id": article.id}
+        else:
+            logging.warning(f"Article with ID {article_id} not found.")
+            return None
+    except Exception as e:
+        logging.error(f"Firestore error while fetching article by ID: {e}")
+        raise
+
+@retry_on_failure()
+def get_article_by_url(url: str):
+    """Fetches an article from Firestore based on its URL."""
+    try:
+        articles_ref = firestore_client.collection("articles")
+        query = articles_ref.where("url", "==", url).limit(1).stream()
+        article = next(query, None)
+        if article:
+            logging.info(f"Article with URL {url} fetched successfully.")
+            return {**article.to_dict(), "id": article.id}
+        else:
+            logging.warning(f"Article with URL {url} not found.")
+            return None
+    except Exception as e:
+        logging.error(f"Firestore error while retrieving article by URL: {e}")
+        return None
+
+@retry_on_failure()
+def delete_article_by_id(article_id: str):
+    """Deletes an article from Firestore by its ID."""
+    try:
+        firestore_client.collection("articles").document(article_id).delete()
+        logging.info(f"Article with ID {article_id} deleted successfully.")
+    except Exception as e:
+        logging.error(f"Firestore error while deleting article: {e}")
+        raise
+
+@retry_on_failure()
+def get_articles_by_hashtag(hashtag: str) -> list:
+    """Fetches all articles containing a specific hashtag."""
+    try:
+        articles_ref = firestore_client.collection("articles").where("hashtags", "array_contains", hashtag)
+        articles = articles_ref.stream()
+        articles_with_hashtag = [{**article.to_dict(), "id": article.id} for article in articles]
+        logging.info(f"Fetched {len(articles_with_hashtag)} articles with hashtag #{hashtag}.")
+        return articles_with_hashtag
+    except Exception as e:
+        logging.error(f"Firestore error while retrieving articles by hashtag: {e}")
+        return []
+
+[File: /home/mhaw/speakloudaudio_cloud/app/routes.py]
+import logging
+from flask import Blueprint, request, jsonify, render_template, redirect, url_for, flash
+from app.firestore_database_operations import (
+    save_article_metadata,
+    get_all_articles,
+    get_recent_articles,
+    get_article_by_id,
+    update_article,
+    get_articles_by_hashtag,
+    delete_article_by_id,
+)
+from app.firestore_utils import log_listen_event
+
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+
+# Define the Blueprint
+main = Blueprint("main", __name__)
+
+# Routes
+@main.route("/")
+def index():
+    """Home page that displays recent articles."""
+    try:
+        recent_articles = get_recent_articles(limit=5)
+        logging.info("Index page loaded successfully with recent articles.")
+        return render_template("index.html", recent_articles=recent_articles)
+    except Exception as e:
+        logging.error(f"Error loading the index page: {e}", exc_info=True)
+        flash("An error occurred while loading the page.")
+        return redirect(url_for("main.index"))
+
+
+@main.route("/processed_articles", methods=["GET"])
+def processed_articles():
+    """Displays all processed articles with sorting, filtering, and pagination."""
+    try:
+        page = request.args.get("page", 1, type=int)
+        per_page = 10
+        sort_by = request.args.get("sort_by", "processed_date")
+        order = request.args.get("order", "desc")
+
+        # Fetch articles and sort
+        all_articles = get_all_articles()
+        reverse = order == "desc"
+        sorted_articles = sorted(
+            all_articles,
+            key=lambda x: x.get(sort_by, ""),
+            reverse=reverse,
+        )
+
+        # Paginate articles
+        total_articles = len(sorted_articles)
+        total_pages = (total_articles + per_page - 1) // per_page
+        start = (page - 1) * per_page
+        paginated_articles = sorted_articles[start:start + per_page]
+
+        logging.info(f"Processed articles loaded successfully. Page: {page}, Total Pages: {total_pages}")
+        return render_template(
+            "processed_articles.html",
+            articles=paginated_articles,
+            page=page,
+            total_pages=total_pages,
+            sort_by=sort_by,
+            order=order,
+        )
+    except Exception as e:
+        logging.error(f"Error loading processed articles: {e}", exc_info=True)
+        flash("An error occurred while loading the articles.")
+        return redirect(url_for("main.index"))
+
+
+@main.route("/article/<string:article_id>")
+def article_detail(article_id):
+    """Displays details of a single article."""
+    try:
+        article = get_article_by_id(article_id)
+        if not article:
+            logging.warning(f"Article with ID {article_id} not found.")
+            flash("Article not found.")
+            return redirect(url_for("main.processed_articles"))
+        logging.info(f"Article details loaded for ID: {article_id}")
+        return render_template("article_detail.html", article=article)
+    except Exception as e:
+        logging.error(f"Error loading article details for ID {article_id}: {e}", exc_info=True)
+        flash("An error occurred while loading the article details.")
+        return redirect(url_for("main.processed_articles"))
+
+
+@main.route("/delete_article/<string:article_id>", methods=["POST"])
+def delete_article(article_id):
+    """Deletes an article by ID."""
+    try:
+        delete_article_by_id(article_id)
+        logging.info(f"Article with ID {article_id} deleted successfully.")
+        flash("Article deleted successfully.")
+        return redirect(url_for("main.processed_articles"))
+    except Exception as e:
+        logging.error(f"Error deleting article with ID {article_id}: {e}", exc_info=True)
+        flash("An error occurred while deleting the article.")
+        return redirect(url_for("main.processed_articles"))
+
+
+@main.route("/search_by_hashtag", methods=["GET"])
+def search_by_hashtag():
+    """Searches for articles by a specific hashtag."""
+    hashtag = request.args.get("hashtag", "").strip()
+    if not hashtag:
+        flash("No hashtag provided.")
+        return redirect(url_for("main.processed_articles"))
+    try:
+        articles = get_articles_by_hashtag(hashtag)
+        logging.info(f"Articles loaded successfully for hashtag: #{hashtag}")
+        return render_template(
+            "processed_articles.html",
+            articles=articles,
+            page=1,
+            total_pages=1,
+            sort_by=None,
+            order=None,
+        )
+    except Exception as e:
+        logging.error(f"Error searching for articles with hashtag #{hashtag}: {e}", exc_info=True)
+        flash("An error occurred while searching for articles.")
+        return redirect(url_for("main.processed_articles"))
+
+
+@main.route("/update_article/<string:article_id>", methods=["POST"])
+def update_article_tags(article_id):
+    """Updates hashtags for an article."""
+    new_hashtags = request.form.get("hashtags", "").split(",")
+    try:
+        update_article(
+            article_id,
+            {"hashtags": [tag.strip() for tag in new_hashtags if tag.strip()]},
+        )
+        logging.info(f"Article hashtags updated successfully for ID: {article_id}")
+        flash("Article hashtags updated successfully.")
+        return redirect(url_for("main.article_detail", article_id=article_id))
+    except Exception as e:
+        logging.error(f"Error updating hashtags for article ID {article_id}: {e}", exc_info=True)
+        flash("An error occurred while updating the hashtags.")
+        return redirect(url_for("main.article_detail", article_id=article_id))
+
+
+@main.route("/process_article", methods=["POST"])
+def process_article():
+    """Processes an article and generates audio."""
+    try:
+        url = request.form.get("url", "").strip()
+        hashtags = request.form.get("hashtags", "").strip().split(",")
+
+        logging.info(f"Processing article with URL: {url} and hashtags: {hashtags}")
+
+        # Validate URL
+        if not validate_url(url):
+            flash("Invalid URL. Please check the URL format and try again.")
+            return redirect(url_for("main.index"))
+
+        # Extract article data
+        article_data = extract_text_from_url(url)
+        if not article_data.get("text"):
+            flash("Failed to extract text from the article.")
+            return redirect(url_for("main.index"))
+
+        # Generate audio file path
+        output_file = generate_audio_file_path(article_data, "downloads")
+
+        # Convert text to audio
+        text_to_speech(article_data["text"], output_file, article_data)
+
+        # Upload to Google Cloud Storage
+        download_link = upload_to_gcs(output_file, os.path.basename(output_file))
+
+        # Save metadata
+        save_article_metadata(
+            title=article_data["title"],
+            source=article_data["source"],
+            url=url,
+            publish_date=article_data["publish_date"],
+            download_link=download_link,
+            authors=article_data["authors"],
+            text_content=article_data["text"],
+            hashtags=[tag.strip() for tag in hashtags if tag.strip()],
+        )
+
+        flash("Article processed successfully.")
+        return redirect(url_for("main.processed_articles"))
+
+    except Exception as e:
+        logging.error(f"Error processing article: {e}", exc_info=True)
+        flash("An unexpected error occurred while processing the article.")
+        return redirect(url_for("main.index"))
+
+==================== HTML Templates ====================
+
+[File: /home/mhaw/speakloudaudio_cloud/app/templates/index.html]
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>SpeakLoudAudio</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+</head>
+
+<body class="bg-gray-100 text-gray-900 dark:bg-gray-900 dark:text-gray-100">
+    <div class="container mx-auto p-6 bg-white dark:bg-gray-800 rounded-lg shadow-lg">
+        <header class="mb-8 text-center">
+            <h1 class="text-4xl font-bold mb-4 text-blue-500 dark:text-blue-400">SpeakLoudAudio</h1>
+            <p class="text-lg mb-6">Convert article text into audio instantly.</p>
+            <nav class="mb-6">
+                <a href="{{ url_for('main.processed_articles') }}"
+                    class="px-6 py-3 bg-blue-500 text-white rounded hover:bg-blue-600 dark:bg-blue-700 dark:hover:bg-blue-600">
+                    View Converted Files
+                </a>
+            </nav>
+        </header>
+
+        <!-- Dark Mode Toggle -->
+        <div class="flex justify-center items-center mb-8">
+            <label for="dark-mode-toggle" class="mr-2 text-sm">Dark Mode</label>
+            <input type="checkbox" id="dark-mode-toggle" class="hidden">
+            <span class="toggle-slider cursor-pointer relative w-10 h-5 bg-gray-300 dark:bg-gray-600 rounded-full">
+                <span class="absolute left-1 top-1 w-3 h-3 bg-white dark:bg-gray-300 rounded-full transform transition-transform duration-300"></span>
+            </span>
+        </div>
+
+        <!-- URL Submission Form -->
+        <main>
+            <form id="url-form" method="POST" class="mb-8 max-w-xl mx-auto">
+                <!-- Article URL Input -->
+                <label for="url-input" class="block text-sm font-semibold mb-2">Article URL</label>
+                <input 
+                    type="url" 
+                    id="url-input" 
+                    name="url" 
+                    placeholder="e.g., https://example.com/article" 
+                    required 
+                    autofocus 
+                    class="w-full p-4 mb-4 border border-gray-300 dark:border-gray-600 rounded focus:outline-none focus:border-blue-500 dark:focus:border-blue-400 bg-white dark:bg-gray-700 text-black dark:text-white">
+
+                <!-- Hashtags Input -->
+                <label for="hashtags" class="block text-sm font-semibold mb-2">Hashtags (comma-separated)</label>
+                <input 
+                    type="text" 
+                    id="hashtags" 
+                    name="hashtags" 
+                    placeholder="e.g., technology, news, audio" 
+                    class="w-full p-4 mb-6 border border-gray-300 dark:border-gray-600 rounded focus:outline-none focus:border-blue-500 dark:focus:border-blue-400 bg-white dark:bg-gray-700 text-black dark:text-white">
+
+                <!-- Submit Button -->
+                <button 
+                    type="submit" 
+                    class="w-full px-4 py-3 bg-blue-500 text-white rounded hover:bg-blue-600 dark:bg-blue-700 dark:hover:bg-blue-600">
+                    Generate Audio
+                </button>
+            </form>
+
+            <!-- Feedback Section -->
+            <div id="feedback" class="max-w-xl mx-auto p-4 hidden text-center bg-gray-100 dark:bg-gray-700 text-gray-700 dark:text-gray-100 rounded"></div>
+
+            <!-- Spinner -->
+            <div id="loading-spinner" class="text-center mb-8 hidden">
+                <p class="mb-4">Processing...</p>
+                <div class="spinner border-t-4 border-blue-500 rounded-full w-12 h-12 animate-spin mx-auto"></div>
+            </div>
+        </main>
+    </div>
+
+    <footer class="mt-12 text-center">
+        <p class="text-gray-600 dark:text-gray-400 mb-2">© 2024 SpeakLoudAudio. All rights reserved.</p>
+        <p class="text-gray-600 dark:text-gray-400">
+            <a href="/about" class="hover:underline">About Us</a> |
+            <a href="/contact" class="hover:underline">Contact</a>
+        </p>
+    </footer>
+
+    <script>
+        // Dark mode toggle
+        const darkModeToggle = document.getElementById("dark-mode-toggle");
+        if (localStorage.getItem("dark-mode") === "true") {
+            document.documentElement.classList.add("dark");
+            darkModeToggle.checked = true;
+        }
+
+        darkModeToggle.addEventListener("change", () => {
+            document.documentElement.classList.toggle("dark", darkModeToggle.checked);
+            localStorage.setItem("dark-mode", darkModeToggle.checked);
+        });
+
+        // Form submission with feedback and spinner
+        document.getElementById("url-form").onsubmit = async (event) => {
+            event.preventDefault(); // Prevent default form submission
+            const form = event.target;
+            const url = form.querySelector("#url-input").value;
+            const hashtags = form.querySelector("#hashtags").value;
+
+            // UI elements
+            const feedback = document.getElementById("feedback");
+            const spinner = document.getElementById("loading-spinner");
+            const button = form.querySelector("button[type=submit]");
+            
+            // Update UI for processing
+            feedback.classList.add("hidden");
+            spinner.classList.remove("hidden");
+            button.textContent = "Processing...";
+            button.disabled = true;
+
+            try {
+                const response = await fetch("/process_article", {
+                    method: "POST",
+                    headers: { "Content-Type": "application/x-www-form-urlencoded" },
+                    body: new URLSearchParams({ url, hashtags }),
+                });
+
+                if (response.ok) {
+                    window.location.href = "/processed_articles";
+                } else {
+                    const result = await response.json();
+                    feedback.textContent = result.message || "An error occurred. Please try again.";
+                    feedback.classList.remove("hidden");
+                }
+            } catch (error) {
+                feedback.textContent = "An unexpected error occurred. Please try again.";
+                feedback.classList.remove("hidden");
+            } finally {
+                spinner.classList.add("hidden");
+                button.textContent = "Generate Audio";
+                button.disabled = false;
+            }
+        };
+    </script>
+</body>
+
+</html>
+
+[File: /home/mhaw/speakloudaudio_cloud/app/templates/article_detail.html]
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>{{ article.title }}</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+</head>
+
+<body class="bg-gray-100 text-gray-900 dark:bg-gray-900 dark:text-gray-100">
+    <div class="container mx-auto p-4 bg-white dark:bg-gray-800 rounded-lg shadow-lg">
+        <header class="mb-6">
+            <h1 class="text-3xl font-bold mb-4">{{ article.title }}</h1>
+            <p class="text-sm text-gray-600 dark:text-gray-400">
+                Source: {{ article.source or "Unknown Source" }} | Published: {{ article.publish_date or "Unknown Date" }} | Authors: {{ article.authors or "Unknown Author" }}
+            </p>
+            <div class="flex justify-between items-center mt-4">
+                <a href="{{ url_for('main.processed_articles') }}" class="px-4 py-2 bg-blue-500 text-white rounded hover:bg-blue-600 dark:bg-blue-700 dark:hover:bg-blue-600">Back to Articles</a>
+                <!-- Dark Mode Toggle -->
+                <div class="flex items-center">
+                    <label for="dark-mode-toggle" class="mr-2 text-sm">Dark Mode</label>
+                    <input type="checkbox" id="dark-mode-toggle" class="hidden">
+                    <span class="relative inline-block w-10 h-5 bg-gray-300 dark:bg-gray-600 rounded-full cursor-pointer">
+                        <span class="absolute left-1 top-1 w-3 h-3 bg-white dark:bg-gray-300 rounded-full transform transition-transform duration-300"></span>
+                    </span>
+                </div>
+            </div>
+        </header>
+
+        <!-- Full Text Section -->
+        <section class="mb-6">
+            <h2 class="text-2xl font-semibold mb-4">Full Text</h2>
+            <p class="whitespace-pre-line">{{ article.text_content }}</p>
+        </section>
+
+        <!-- Audio Section -->
+        <section class="mb-6">
+            <h2 class="text-2xl font-semibold mb-4">Audio</h2>
+            <audio controls class="w-full max-w-md">
+                <source src="{{ article.download_link }}" type="audio/mp3">
+                Your browser does not support the audio element.
+            </audio>
+            {% if article.audio_length %}
+            <p class="mt-2 text-sm text-gray-600 dark:text-gray-400">Audio Length: {{ article.audio_length }} seconds</p>
+            {% endif %}
+        </section>
+
+        <!-- Hashtags Section -->
+        <section class="mb-6">
+            <h2 class="text-2xl font-semibold mb-4">Hashtags</h2>
+            <ul class="flex flex-wrap gap-2 mb-4">
+                {% for hashtag in article.hashtags %}
+                <li>
+                    <a href="{{ url_for('main.search_by_hashtag', hashtag=hashtag) }}"
+                        class="cursor-pointer px-3 py-1 bg-blue-100 text-blue-500 rounded-full dark:bg-blue-900 dark:text-blue-300 hover:underline">
+                        #{{ hashtag }}
+                    </a>
+                </li>
+                {% endfor %}
+            </ul>
+            <form method="POST" action="{{ url_for('main.update_article_tags', article_id=article.id) }}" class="flex items-center gap-2">
+                <input type="text" name="hashtags" placeholder="Add hashtags separated by commas"
+                    class="flex-grow p-2 border border-gray-300 rounded dark:bg-gray-700 dark:border-gray-600 dark:text-gray-200">
+                <button type="submit" class="px-4 py-2 bg-blue-500 text-white rounded hover:bg-blue-600 dark:bg-blue-700 dark:hover:bg-blue-600">Update</button>
+            </form>
+        </section>
+
+        <!-- Share Link Section -->
+        <section class="mb-6">
+            <h2 class="text-2xl font-semibold mb-4">Share</h2>
+            <div class="flex items-center">
+                <input type="text" id="share-link" value="{{ request.url }}" readonly
+                    class="w-full p-2 border border-gray-300 rounded mr-2 dark:bg-gray-700 dark:border-gray-600 dark:text-gray-200">
+                <button onclick="copyToClipboard()"
+                    class="px-4 py-2 bg-blue-500 text-white rounded hover:bg-blue-600 dark:bg-blue-700 dark:hover:bg-blue-600">Copy
+                    Link</button>
+            </div>
+            <p id="copy-message" class="text-sm text-green-500 mt-2 hidden">Link copied to clipboard!</p>
+        </section>
+    </div>
+
+    <script>
+        // Dark mode toggle functionality
+        const darkModeToggle = document.getElementById("dark-mode-toggle");
+
+        // Set dark mode based on user preference
+        if (localStorage.getItem("dark-mode") === "true") {
+            document.documentElement.classList.add("dark");
+            darkModeToggle.checked = true;
+        }
+
+        // Toggle dark mode on user interaction and save preference
+        document.addEventListener("DOMContentLoaded", () => {
+            const darkModeToggle = document.getElementById("dark-mode-toggle");
+            const isDarkMode = localStorage.getItem("dark-mode") === "true";
+
+            // Set initial state
+            if (isDarkMode) document.documentElement.classList.add("dark");
+            darkModeToggle.checked = isDarkMode;
+
+            // Toggle dark mode on change
+            darkModeToggle.addEventListener("change", () => {
+                document.documentElement.classList.toggle("dark", darkModeToggle.checked);
+                localStorage.setItem("dark-mode", darkModeToggle.checked);
+            });
+        });
+
+
+        // Function to copy the share link to clipboard
+        function copyToClipboard() {
+            const shareLink = document.getElementById("share-link");
+            shareLink.select();
+            navigator.clipboard.writeText(shareLink.value).then(() => {
+                const copyMessage = document.getElementById("copy-message");
+                copyMessage.classList.remove("hidden");
+                setTimeout(() => copyMessage.classList.add("hidden"), 2000);
+            }).catch(err => console.error("Failed to copy link: ", err));
+        }
+    </script>
+    <script data-goatcounter="https://speakloudaudiocloud.goatcounter.com/count"
+    async src="//gc.zgo.at/count.js"></script>
+</body>
+
+</html>
+
+[File: /home/mhaw/speakloudaudio_cloud/app/templates/processed_articles.html]
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Processed Articles</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <link rel="stylesheet" href="https://cdn.datatables.net/1.11.5/css/jquery.dataTables.min.css">
+    <script src="https://code.jquery.com/jquery-3.6.0.min.js"></script>
+    <script src="https://cdn.datatables.net/1.11.5/js/jquery.dataTables.min.js"></script>
+</head>
+
+<body class="bg-gray-100 text-gray-900 dark:bg-gray-900 dark:text-gray-100">
+    <div class="container mx-auto p-4 bg-white dark:bg-gray-800 rounded-lg shadow-lg">
+        <header class="mb-6 flex justify-between items-center">
+            <h1 class="text-3xl font-bold text-blue-500 dark:text-blue-400">Processed Articles</h1>
+            <div class="flex items-center">
+                <label for="dark-mode-toggle" class="mr-2 text-sm">Dark Mode</label>
+                <input type="checkbox" id="dark-mode-toggle" class="hidden">
+                <span class="toggle-slider cursor-pointer relative w-10 h-5 bg-gray-300 dark:bg-gray-600 rounded-full">
+                    <span class="absolute left-1 top-1 w-3 h-3 bg-white dark:bg-gray-300 rounded-full transform transition-transform duration-300"></span>
+                </span>
+            </div>
+        </header>
+
+        <div class="mb-6">
+            <a href="/" class="inline-block px-4 py-2 bg-blue-500 text-white rounded hover:bg-blue-600 dark:bg-blue-700 dark:hover:bg-blue-600">Back to Main Page</a>
+        </div>
+
+        <!-- Filter by Hashtag -->
+        <div class="mb-6">
+            <label for="hashtag-filter" class="block text-sm font-semibold">Filter by Hashtag</label>
+            <input type="text" id="hashtag-filter" placeholder="Enter a hashtag (e.g., #technology)"
+                class="w-full p-2 mt-2 border border-gray-300 rounded focus:outline-none focus:border-blue-500 dark:border-gray-600 dark:bg-gray-700 dark:text-white">
+        </div>
+
+        <!-- Articles Table -->
+        <div class="overflow-x-auto">
+            <table id="articles-table" class="min-w-full bg-white border border-gray-300 dark:bg-gray-800">
+                <thead>
+                    <tr class="bg-gray-200 dark:bg-gray-700">
+                        <th class="p-3 text-left">Title</th>
+                        <th class="p-3 text-left">Source</th>
+                        <th class="p-3 text-left">Original URL</th>
+                        <th class="p-3 text-left">Publish Date</th>
+                        <th class="p-3 text-left">Processed Date</th>
+                        <th class="p-3 text-left">Hashtags</th>
+                        <th class="p-3 text-left">Listen Count</th>
+                        <th class="p-3 text-left">Actions</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    {% if articles %}
+                        {% for article in articles %}
+                            <tr class="border-b hover:bg-gray-100 dark:hover:bg-gray-700">
+                                <td class="p-3">{{ article.title or "N/A" }}</td>
+                                <td class="p-3">{{ article.source or "Unknown Source" }}</td>
+                                <td class="p-3">
+                                    <a href="{{ article.url }}" target="_blank" rel="noopener noreferrer" class="text-blue-500 hover:underline dark:text-blue-400">{{ article.url }}</a>
+                                </td>
+                                <td class="p-3">{{ article.publish_date or "N/A" }}</td>
+                                <td class="p-3">{{ article.processed_date or "N/A" }}</td>
+                                <td class="p-3">
+                                    {% if article.hashtags %}
+                                        <div class="flex flex-wrap gap-2">
+                                            {% for hashtag in article.hashtags %}
+                                                <span data-hashtag="{{ hashtag }}" class="cursor-pointer px-2 py-1 bg-gray-200 dark:bg-gray-700 text-gray-900 dark:text-gray-100 rounded-lg text-sm hashtag-filter-item">
+                                                    #{{ hashtag }}
+                                                </span>
+                                            {% endfor %}
+                                        </div>
+                                    {% else %}
+                                        <span class="text-gray-500 dark:text-gray-400">No Hashtags</span>
+                                    {% endif %}
+                                </td>
+                                <td class="p-3">{{ article.listen_count or 0 }}</td>
+                                <td class="p-3 flex space-x-2">
+                                    {% if article.id %}
+                                        <a href="{{ url_for('main.article_detail', article_id=article.id) }}" class="text-blue-500 font-bold hover:underline dark:text-blue-400">View</a>
+                                        <form action="{{ url_for('main.delete_article', article_id=article.id) }}" method="POST" class="inline">
+                                            <button type="submit" class="text-red-500 font-bold hover:underline">Delete</button>
+                                        </form>
+                                    {% else %}
+                                        <span class="text-gray-500 dark:text-gray-400">No Actions Available</span>
+                                    {% endif %}
+                                </td>
+                            </tr>
+                        {% endfor %}
+                    {% else %}
+                        <tr>
+                            <td colspan="8" class="p-3 text-center">No articles have been processed yet. Please upload an article to generate audio.</td>
+                        </tr>
+                    {% endif %}
+                </tbody>
+            </table>
+        </div>
+
+        <!-- Pagination Controls -->
+        <div class="flex flex-wrap justify-center mt-6 space-x-2">
+            {% if page > 1 %}
+                <a href="{{ url_for('main.processed_articles', page=page-1) }}" class="px-4 py-2 bg-blue-500 text-white rounded hover:bg-blue-600 dark:bg-blue-700 dark:hover:bg-blue-600">Previous</a>
+            {% endif %}
+            <span class="px-4 py-2">Page {{ page }} of {{ total_pages }}</span>
+            {% if page < total_pages %}
+                <a href="{{ url_for('main.processed_articles', page=page+1) }}" class="px-4 py-2 bg-blue-500 text-white rounded hover:bg-blue-600 dark:bg-blue-700 dark:hover:bg-blue-600">Next</a>
+            {% endif %}
+        </div>
+    </div>
+
+    <script>
+        const darkModeToggle = document.getElementById("dark-mode-toggle");
+
+        if (localStorage.getItem("dark-mode") === "true") {
+            document.documentElement.classList.add("dark");
+            darkModeToggle.checked = true;
+        }
+
+        document.addEventListener("DOMContentLoaded", () => {
+            const darkModeToggle = document.getElementById("dark-mode-toggle");
+            const isDarkMode = localStorage.getItem("dark-mode") === "true";
+
+            // Set initial state
+            if (isDarkMode) document.documentElement.classList.add("dark");
+            darkModeToggle.checked = isDarkMode;
+
+            // Toggle dark mode on change
+            darkModeToggle.addEventListener("change", () => {
+                document.documentElement.classList.toggle("dark", darkModeToggle.checked);
+                localStorage.setItem("dark-mode", darkModeToggle.checked);
+            });
+        });
+
+        
+
+        $(document).ready(function () {
+            const table = $('#articles-table').DataTable({
+                paging: true,
+                info: true,
+                order: [[4, "desc"]],
+                columnDefs: [{ orderable: false, targets: [5, 6, 7] }]
+            });
+
+            const filterInput = $('#hashtag-filter');
+            $('.hashtag-filter-item').on('click', function () {
+                const hashtag = $(this).data('hashtag');
+                filterInput.val(`#${hashtag}`);
+                table.search(`#${hashtag}`).draw();
+            });
+
+            filterInput.on('input', function () {
+                table.search(this.value).draw();
+            });
+        });
+    </script>
+</body>
+
+</html>
+
+==================== CSS Files ====================
+
+==================== JavaScript Files ====================
+
+==================== Other Static Files ====================
+
+==================== Configuration Files ====================
+
+[File: /home/mhaw/speakloudaudio_cloud/config.py]
+import os
+
+class Config:
+    # Flask configuration
+    SECRET_KEY = os.getenv("SECRET_KEY", "hawsmith1")
+    
+    # Google Cloud configuration
+    GOOGLE_APPLICATION_CREDENTIALS = os.getenv(
+        "GOOGLE_APPLICATION_CREDENTIALS", "/app/speakloudaudio-7a34eeceb530.json"
+    )
+    GCS_BUCKET_NAME = os.getenv("GCS_BUCKET_NAME", "speakloudaudio")
+
+    # App-specific settings
+    TTS_LANGUAGE_CODE = os.getenv("TTS_LANGUAGE_CODE", "en-US")
+    TTS_VOICE_GENDER = os.getenv("TTS_VOICE_GENDER", "NEUTRAL")
+    
+    # Database configuration (Firestore in this case)
+    FIRESTORE_PROJECT_ID = os.getenv("FIRESTORE_PROJECT_ID", "speakloudaudio")
+
+    # Logging configuration
+    LOG_LEVEL = os.getenv("LOG_LEVEL", "DEBUG")
+[File: /home/mhaw/speakloudaudio_cloud/Dockerfile]
+# Stage 1: Build environment
+FROM python:3.10-slim AS builder
+
+# Set the working directory
+WORKDIR /app
+
+# Copy requirements and install system dependencies first
+COPY requirements.txt .
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends ffmpeg && \
+    apt-get clean && rm -rf /var/lib/apt/lists/*
+
+# Then install Python dependencies
+RUN pip install --no-cache-dir -r requirements.txt
+
+# Stage 2: Runtime environment (smaller final image)
+FROM python:3.10-slim AS runtime
+
+# Install ffmpeg and ffprobe in runtime stage
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends ffmpeg && \
+    apt-get clean && rm -rf /var/lib/apt/lists/*
+
+# Copy installed dependencies from builder stage
+COPY --from=builder /usr/local/lib/python3.10 /usr/local/lib/python3.10
+
+# Set the working directory
+WORKDIR /app
+
+# Copy application code into the container
+COPY . .
+
+# Set file permissions for sensitive files
+RUN chmod 600 /app/speakloudaudio-7a34eeceb530.json && \
+    mkdir -p /app/templates /app/static /app/downloads && \
+    chmod -R 755 /app/templates /app/static /app/downloads
+
+# Add a non-root user for security
+RUN useradd -ms /bin/bash appuser && \
+    chown -R appuser:appuser /app
+
+# Switch to non-root user
+USER appuser
+
+# Set environment variable for Google Cloud credentials
+ENV GOOGLE_APPLICATION_CREDENTIALS="/app/speakloudaudio-7a34eeceb530.json"
+
+# Expose the application port
+EXPOSE 8080
+
+# Define health check to ensure the service is running
+HEALTHCHECK --interval=30s --timeout=10s --retries=3 \
+  CMD curl -f http://localhost:5000/health || exit 1
+
+# Run Gunicorn with custom settings
+CMD ["python", "-m", "gunicorn", "-b", "0.0.0.0:8080", "--timeout", "120", "--workers", "1", "run:app"]
+[File: /home/mhaw/speakloudaudio_cloud/docker-compose.yml]
+version: '3.8'
+
+services:
+  speakloudaudio:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: speakloudaudio_cloud:latest
+    container_name: speakloudaudio_cloud
+    ports:
+      - "5000:5000"
+    environment:
+      # App and Google Cloud credentials
+      GOOGLE_APPLICATION_CREDENTIALS: "/app/speakloudaudio-7a34eeceb530.json"
+      GCS_BUCKET_NAME: "speakloudaudio"
+      
+      # Text-to-Speech Configuration
+      TTS_LANGUAGE_CODE: "en-US"
+      TTS_VOICE_GENDER: "NEUTRAL"
+
+      # Flask App Configuration
+      SECRET_KEY: "${SECRET_KEY:-your_default_secret_key}"
+
+      # Firestore Configuration
+      FIRESTORE_PROJECT_ID: "${FIRESTORE_PROJECT_ID:-your_project_id}"
+
+      # Logging
+      LOG_LEVEL: "INFO"
+
+    volumes:
+      - ./data:/app/data
+      - ./speakloudaudio-7a34eeceb530.json:/app/speakloudaudio-7a34eeceb530.json:ro
+
+    networks:
+      - speakloud_network
+
+    # Health check for the container
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:5000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+    restart: unless-stopped
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+networks:
+  speakloud_network:
+    driver: bridge

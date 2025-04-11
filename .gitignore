@@ -1,0 +1,32 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.log
+.env
+
+# macOS
+.DS_Store
+
+# VSCode
+.vscode/
+*.code-workspace
+
+# Docker
+Dockerfile
+*.pid
+
+# Downloads / Generated files
+downloads/
+*.mp3
+
+# SQLite and local test DBs
+*.db
+
+# Your credentials (already good)
+speakloudaudio-*.json
+
+# Other
+bash_history/
+bash_history

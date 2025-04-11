@@ -2,116 +2,129 @@
 <html lang="en">
 
 <head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>{{ article.title }}</title>
-    <script src="https://cdn.tailwindcss.com"></script>
-    <link rel="stylesheet" href="{{ url_for('static', filename='css/styles.css') }}">
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>{{ article.title }}</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <link rel="stylesheet" href="{{ url_for('static', filename='css/styles.css') }}">
 </head>
 
 <body class="bg-gray-100 text-gray-900 dark:bg-gray-900 dark:text-gray-100">
-    <div class="container mx-auto p-4 bg-white dark:bg-gray-800 rounded-lg shadow-lg">
-        <header class="mb-6">
-            <h1 class="text-3xl font-bold mb-4">{{ article.title }}</h1>
-            <p class="text-sm text-gray-600 dark:text-gray-400">
-                Source: {{ article.source or "Unknown Source" }} | Published: {{ article.publish_date or "Unknown Date" }} | Authors: {{ article.authors or "Unknown Author" }}
-            </p>
-            <div class="flex justify-between items-center mt-4">
-                <a href="{{ url_for('main.processed_articles') }}" class="px-4 py-2 bg-blue-500 text-white rounded hover:bg-blue-600 dark:bg-blue-700 dark:hover:bg-blue-600">Back to Articles</a>
-                <div class="flex items-center">
-                    <label for="dark-mode-toggle" class="mr-2 text-sm">Dark Mode</label>
-                    <input type="checkbox" id="dark-mode-toggle" class="hidden">
-                    <span class="relative inline-block w-10 h-5 bg-gray-300 dark:bg-gray-600 rounded-full cursor-pointer">
-                        <span class="absolute left-1 top-1 w-3 h-3 bg-white dark:bg-gray-300 rounded-full transform transition-transform duration-300"></span>
-                    </span>
-                </div>
-            </div>
-        </header>
+  <div class="container mx-auto p-4 bg-white dark:bg-gray-800 rounded-lg shadow-lg">
+    <header class="mb-6">
+      <h1 class="text-3xl font-bold mb-4">{{ article.title }}</h1>
+      <p class="text-sm text-gray-600 dark:text-gray-400">
+        Source: {{ article.source or "Unknown Source" }} | Published: {{ article.publish_date or "Unknown Date" }} | Authors: {{ article.authors or "Unknown Author" }}
+      </p>
+      <div class="flex justify-between items-center mt-4">
+        <a href="{{ url_for('main.processed_articles') }}" class="px-4 py-2 bg-blue-500 text-white rounded hover:bg-blue-600 dark:bg-blue-700 dark:hover:bg-blue-600">Back to Articles</a>
+        <!-- Dark Mode Toggle -->
+        <div class="flex items-center">
+          <label for="dark-mode-toggle" class="mr-2 text-sm">Dark Mode</label>
+          <input type="checkbox" id="dark-mode-toggle" class="hidden">
+          <span class="relative inline-block w-10 h-5 bg-gray-300 dark:bg-gray-600 rounded-full cursor-pointer">
+            <span class="absolute left-1 top-1 w-3 h-3 bg-white dark:bg-gray-300 rounded-full transform transition-transform duration-300"></span>
+          </span>
+        </div>
+      </div>
+    </header>
 
-        <!-- Full Text Section -->
-        <section class="mb-6">
-            <h2 class="text-2xl font-semibold mb-4">Full Text</h2>
-            <p class="whitespace-pre-line">{{ article.text_content }}</p>
-        </section>
-
-        <!-- Audio Section -->
-        <section class="mb-6">
-            <h2 class="text-2xl font-semibold mb-4">Audio</h2>
-            <audio controls class="w-full max-w-md">
-                <source src="{{ article.download_link }}" type="audio/mp3">
-                Your browser does not support the audio element.
-            </audio>
-            {% if article.audio_length %}
-            <p class="mt-2 text-sm text-gray-600 dark:text-gray-400">Audio Length: {{ article.audio_length }} seconds</p>
-            {% endif %}
-            {% if article.voice_name %}
-            <p class="text-sm text-gray-600 dark:text-gray-400">Voice Used: {{ article.voice_name }}</p>
-            {% endif %}
-        </section>
-
-        <!-- Hashtags Section -->
-        <section class="mb-6">
-            <h2 class="text-2xl font-semibold mb-4">Hashtags</h2>
-            <ul class="flex flex-wrap gap-2 mb-4">
-                {% for hashtag in article.hashtags %}
-                <li>
-                    <a href="{{ url_for('main.search_by_hashtag', hashtag=hashtag) }}"
-                        class="cursor-pointer px-3 py-1 bg-blue-100 text-blue-500 rounded-full dark:bg-blue-900 dark:text-blue-300 hover:underline">
-                        #{{ hashtag }}
-                    </a>
-                </li>
-                {% endfor %}
-            </ul>
-            <form method="POST" action="{{ url_for('main.update_article_tags', article_id=article.id) }}" class="flex items-center gap-2">
-                <input type="text" name="hashtags" placeholder="Add hashtags separated by commas"
-                    class="flex-grow p-2 border border-gray-300 rounded dark:bg-gray-700 dark:border-gray-600 dark:text-gray-200">
-                <button type="submit" class="px-4 py-2 bg-blue-500 text-white rounded hover:bg-blue-600 dark:bg-blue-700 dark:hover:bg-blue-600">Update</button>
-            </form>
-        </section>
-
-        <!-- Share Link Section -->
-        <section class="mb-6">
-            <h2 class="text-2xl font-semibold mb-4">Share</h2>
-            <div class="flex items-center">
-                <input type="text" id="share-link" value="{{ request.url }}" readonly
-                    class="w-full p-2 border border-gray-300 rounded mr-2 dark:bg-gray-700 dark:border-gray-600 dark:text-gray-200">
-                <button onclick="copyToClipboard()"
-                    class="px-4 py-2 bg-blue-500 text-white rounded hover:bg-blue-600 dark:bg-blue-700 dark:hover:bg-blue-600">Copy
-                    Link</button>
-            </div>
-            <p id="copy-message" class="text-sm text-green-500 mt-2 hidden">Link copied to clipboard!</p>
-        </section>
+    <!-- Link Preview -->
+    <div class="mb-6">
+      <a href="{{ article.url }}" target="_blank" rel="noopener noreferrer"
+         class="block p-4 rounded-lg bg-blue-50 dark:bg-blue-900 hover:bg-blue-100 dark:hover:bg-blue-800 transition">
+        <p class="text-sm font-semibold text-blue-800 dark:text-blue-200 truncate">
+          {{ article.url }}
+        </p>
+        <p class="text-xs text-gray-600 dark:text-gray-400 mt-1">
+          Click to view original article
+        </p>
+      </a>
     </div>
 
-    <script>
-        const darkModeToggle = document.getElementById("dark-mode-toggle");
-        if (localStorage.getItem("dark-mode") === "true") {
-            document.documentElement.classList.add("dark");
-            darkModeToggle.checked = true;
-        }
+    <!-- Full Text Section -->
+    <section class="mb-6">
+      <h2 class="text-2xl font-semibold mb-4">Full Text</h2>
+      <p class="whitespace-pre-line leading-relaxed">{{ article.text_content }}</p>
+    </section>
 
-        document.addEventListener("DOMContentLoaded", () => {
-            const isDarkMode = localStorage.getItem("dark-mode") === "true";
-            if (isDarkMode) document.documentElement.classList.add("dark");
-            darkModeToggle.checked = isDarkMode;
+    <!-- Audio Section -->
+    <section class="mb-6">
+      <h2 class="text-2xl font-semibold mb-4">Audio</h2>
+      <audio controls class="w-full max-w-md">
+        <source src="{{ article.download_link }}" type="audio/mp3">
+        Your browser does not support the audio element.
+      </audio>
+      {% if article.audio_length %}
+        <p class="mt-2 text-sm text-gray-600 dark:text-gray-400">Audio Length: {{ article.audio_length }} seconds</p>
+      {% endif %}
+      {% if article.voice_name %}
+        <p class="text-sm text-gray-600 dark:text-gray-400">Voice Used: {{ article.voice_name }}</p>
+      {% endif %}
+    </section>
 
-            darkModeToggle.addEventListener("change", () => {
-                document.documentElement.classList.toggle("dark", darkModeToggle.checked);
-                localStorage.setItem("dark-mode", darkModeToggle.checked);
-            });
-        });
+    <!-- Hashtags Section -->
+    <section class="mb-6">
+      <h2 class="text-2xl font-semibold mb-4">Hashtags</h2>
+      <ul class="flex flex-wrap gap-2 mb-4">
+        {% for hashtag in article.hashtags %}
+          <li>
+            <a href="{{ url_for('main.search_by_hashtag', hashtag=hashtag) }}"
+               class="cursor-pointer px-3 py-1 bg-blue-100 text-blue-500 rounded-full dark:bg-blue-900 dark:text-blue-300 hover:underline">
+              #{{ hashtag }}
+            </a>
+          </li>
+        {% endfor %}
+      </ul>
+      <form method="POST" action="{{ url_for('main.update_article_tags', article_id=article.id) }}" class="flex items-center gap-2">
+        <input type="text" name="hashtags" placeholder="Add hashtags separated by commas"
+               class="flex-grow p-2 border border-gray-300 rounded dark:bg-gray-700 dark:border-gray-600 dark:text-gray-200">
+        <button type="submit" class="px-4 py-2 bg-blue-500 text-white rounded hover:bg-blue-600 dark:bg-blue-700 dark:hover:bg-blue-600">Update</button>
+      </form>
+    </section>
 
-        function copyToClipboard() {
-            const shareLink = document.getElementById("share-link");
-            shareLink.select();
-            navigator.clipboard.writeText(shareLink.value).then(() => {
-                const copyMessage = document.getElementById("copy-message");
-                copyMessage.classList.remove("hidden");
-                setTimeout(() => copyMessage.classList.add("hidden"), 2000);
-            }).catch(err => console.error("Failed to copy link: ", err));
-        }
-    </script>
-    <script data-goatcounter="https://speakloudaudiocloud.goatcounter.com/count" async src="//gc.zgo.at/count.js"></script>
+    <!-- Share Link Section -->
+    <section class="mb-6">
+      <h2 class="text-2xl font-semibold mb-4">Share</h2>
+      <div class="flex items-center">
+        <input type="text" id="share-link" value="{{ request.url }}" readonly
+               class="w-full p-2 border border-gray-300 rounded mr-2 dark:bg-gray-700 dark:border-gray-600 dark:text-gray-200">
+        <button onclick="copyToClipboard()"
+                class="px-4 py-2 bg-blue-500 text-white rounded hover:bg-blue-600 dark:bg-blue-700 dark:hover:bg-blue-600">Copy Link</button>
+      </div>
+      <p id="copy-message" class="text-sm text-green-500 mt-2 hidden">Link copied to clipboard!</p>
+    </section>
+  </div>
+
+  <script>
+    const darkModeToggle = document.getElementById("dark-mode-toggle");
+    if (localStorage.getItem("dark-mode") === "true") {
+      document.documentElement.classList.add("dark");
+      darkModeToggle.checked = true;
+    }
+
+    document.addEventListener("DOMContentLoaded", () => {
+      const isDarkMode = localStorage.getItem("dark-mode") === "true";
+      if (isDarkMode) document.documentElement.classList.add("dark");
+      darkModeToggle.checked = isDarkMode;
+
+      darkModeToggle.addEventListener("change", () => {
+        document.documentElement.classList.toggle("dark", darkModeToggle.checked);
+        localStorage.setItem("dark-mode", darkModeToggle.checked);
+      });
+    });
+
+    function copyToClipboard() {
+      const shareLink = document.getElementById("share-link");
+      shareLink.select();
+      navigator.clipboard.writeText(shareLink.value).then(() => {
+        const copyMessage = document.getElementById("copy-message");
+        copyMessage.classList.remove("hidden");
+        setTimeout(() => copyMessage.classList.add("hidden"), 2000);
+      }).catch(err => console.error("Failed to copy link: ", err));
+    }
+  </script>
+  <script data-goatcounter="https://speakloudaudiocloud.goatcounter.com/count" async src="//gc.zgo.at/count.js"></script>
 </body>
 
 </html>

@@ -7,6 +7,13 @@ from typing import Dict, Any
 import requests
 from requests.exceptions import HTTPError, RequestException
 
+# Optional: fallback parser
+try:
+    import trafilatura
+    TRAFILATURA_AVAILABLE = True
+except ImportError:
+    TRAFILATURA_AVAILABLE = False
+
 # Custom User-Agent header to avoid bot detection
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36",
@@ -14,10 +21,21 @@ HEADERS = {
     "Accept-Language": "en-US,en;q=0.9",
 }
 
+def remove_repeated_paragraphs(text: str) -> str:
+    seen = set()
+    cleaned = []
+    for paragraph in text.split('\n'):
+        trimmed = paragraph.strip()
+        if trimmed and trimmed not in seen:
+            cleaned.append(trimmed)
+            seen.add(trimmed)
+    return '\n\n'.join(cleaned)
+
 def extract_text_from_url(url: str, retries: int = 3, backoff_factor: int = 2) -> Dict[str, Any]:
     """
-    Extracts article text, title, author info, and publish date from the provided URL.
-    Tries newspaper3k first, then falls back to BeautifulSoup + meta tags.
+    Extracts article text, title, and author information from the provided URL.
+    Returns a dictionary containing the text and metadata.
+    Retries extraction with exponential backoff if it fails.
     """
     article_data = {
         "title": "Unknown Title",
@@ -27,18 +45,36 @@ def extract_text_from_url(url: str, retries: int = 3, backoff_factor: int = 2) -
         "source": url
     }
 
+    # Try enhanced handling for known problematic domains
+    domain = requests.utils.urlparse(url).netloc
+    use_trafilatura = ("nytimes.com" in domain) and TRAFILATURA_AVAILABLE
+
+    if use_trafilatura:
+        logging.info("Using trafilatura for URL: %s", url)
+        try:
+            downloaded = trafilatura.fetch_url(url)
+            if downloaded:
+                result = trafilatura.extract(downloaded, include_comments=False, include_tables=False)
+                if result:
+                    article_data["text"] = remove_repeated_paragraphs(result)
+                    article_data["title"] = url  # Trafilatura lacks title extraction
+                    return article_data
+        except Exception as e:
+            logging.warning(f"Trafilatura fallback failed for {url}: {e}")
+
+    # Retry loop for newspaper3k
     for attempt in range(retries):
         try:
-            config = Config()
-            config.browser_user_agent = HEADERS["User-Agent"]
-            config.request_timeout = 15
+            user_agent_config = Config()
+            user_agent_config.browser_user_agent = HEADERS['User-Agent']
+            user_agent_config.request_timeout = 15
 
-            article = Article(url, config=config)
+            article = Article(url, config=user_agent_config)
             article.download()
             article.parse()
 
             article_data["title"] = article.title or article_data["title"]
-            article_data["text"] = article.text or article_data["text"]
+            article_data["text"] = remove_repeated_paragraphs(article.text or "")
             article_data["authors"] = article.authors or article_data["authors"]
             if article.publish_date:
                 article_data["publish_date"] = article.publish_date.strftime("%Y-%m-%d")
@@ -55,41 +91,29 @@ def extract_text_from_url(url: str, retries: int = 3, backoff_factor: int = 2) -
 
         time.sleep(backoff_factor ** attempt)
 
-    # Fallback extraction using requests + BeautifulSoup
+    # Fallback using BeautifulSoup
     try:
-        logging.info(f"Fallback extraction using BeautifulSoup for URL: {url}")
+        logging.info(f"Attempting fallback extraction using BeautifulSoup for URL: {url}")
         response = requests.get(url, headers=HEADERS, timeout=15)
         response.raise_for_status()
+
         soup = BeautifulSoup(response.content, 'html.parser')
+        title_tag = soup.find('title')
+        if title_tag:
+            article_data["title"] = title_tag.text.strip()
 
-        # Title
-        if soup.title:
-            article_data["title"] = soup.title.string.strip()
-
-        # Text
         paragraphs = soup.find_all('p')
         if paragraphs:
-            article_data["text"] = " ".join(p.get_text().strip() for p in paragraphs if p.get_text().strip())
-
-        # Metadata from OpenGraph, Twitter, or article meta tags
-        meta_title = soup.find("meta", property="og:title") or soup.find("meta", attrs={"name": "twitter:title"})
-        if meta_title and meta_title.get("content"):
-            article_data["title"] = meta_title["content"]
-
-        meta_author = soup.find("meta", attrs={"name": "author"})
-        if meta_author and meta_author.get("content"):
-            article_data["authors"] = [meta_author["content"]]
-
-        meta_date = soup.find("meta", property="article:published_time") or soup.find("meta", attrs={"name": "date"})
-        if meta_date and meta_date.get("content"):
-            try:
-                article_data["publish_date"] = datetime.datetime.fromisoformat(meta_date["content"]).strftime("%Y-%m-%d")
-            except Exception as e:
-                logging.warning(f"Could not parse publish date: {e}")
+            raw_text = "\n".join(p.get_text().strip() for p in paragraphs)
+            article_data["text"] = remove_repeated_paragraphs(raw_text)
 
         logging.info(f"Fallback extraction successful for URL: {url}")
 
+    except HTTPError as http_err:
+        logging.error(f"HTTP error during fallback extraction for {url}: {http_err}")
+    except RequestException as req_err:
+        logging.error(f"Request error during fallback extraction for {url}: {req_err}")
     except Exception as e:
-        logging.error(f"Fallback extraction failed for URL {url}: {e}")
+        logging.error(f"Unexpected error during fallback extraction for {url}: {e}")
 
     return article_data

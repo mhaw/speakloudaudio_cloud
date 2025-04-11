@@ -20,6 +20,7 @@ Dockerfile
 # Downloads / Generated files
 downloads/
 *.mp3
+old/
 
 # SQLite and local test DBs
 *.db
